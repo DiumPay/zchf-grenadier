@@ -2,9 +2,16 @@ package api
 
 import (
 	"fmt"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/middleware/cache"
+	"github.com/gofiber/fiber/v3/middleware/cors"
+	"github.com/gofiber/fiber/v3/middleware/helmet"
+	"github.com/gofiber/fiber/v3/middleware/limiter"
+	"github.com/gofiber/fiber/v3/middleware/recover"
 
 	"github.com/DiumPay/zchf-grenadier/store"
 )
@@ -14,6 +21,8 @@ type Server struct {
 	st  *store.Store
 	// callback to get last scanned block (avoids circular import to indexer)
 	lastBlockFn func() uint64
+	// trusted proxy hops: 1 for caddy only, 2 for cloudflare -> caddy
+	proxyHops int
 }
 
 func New(st *store.Store, lastBlockFn func() uint64) *Server {
@@ -21,33 +30,98 @@ func New(st *store.Store, lastBlockFn func() uint64) *Server {
 		AppName:       "grenadier",
 		StrictRouting: false,
 		CaseSensitive: false,
+		ReadTimeout:   15 * time.Second,
+		WriteTimeout:  15 * time.Second,
+		IdleTimeout:   60 * time.Second,
+		BodyLimit:     1 << 20, // 1mb. we accept no bodies anyway.
+		ProxyHeader:   fiber.HeaderXForwardedFor,
 	})
-	s := &Server{app: app, st: st, lastBlockFn: lastBlockFn}
+
+	s := &Server{
+		app:         app,
+		st:          st,
+		lastBlockFn: lastBlockFn,
+		proxyHops:   atoiDefault(os.Getenv("GRENADIER_PROXY_HOPS"), 1),
+	}
 	s.routes()
 	return s
 }
 
 func (s *Server) routes() {
-	// CORS — allow frontend to fetch from any origin
+	// panic recovery: one bad request can't crash the server
+	s.app.Use(recover.New())
+
+	// security headers
+	s.app.Use(helmet.New(helmet.Config{
+		XSSProtection:             "0",
+		ContentTypeNosniff:        "nosniff",
+		XFrameOptions:             "DENY",
+		ReferrerPolicy:            "no-referrer",
+		CrossOriginEmbedderPolicy: "require-corp",
+		CrossOriginOpenerPolicy:   "same-origin",
+		CrossOriginResourcePolicy: "cross-origin",
+	}))
+
+	// CORS — public read API
+	s.app.Use(cors.New(cors.Config{
+		AllowOrigins:  []string{"*"},
+		AllowMethods:  []string{"GET", "HEAD", "OPTIONS"},
+		AllowHeaders:  []string{"Content-Type"},
+		ExposeHeaders: []string{"Content-Length"},
+		MaxAge:        86400,
+	}))
+
+	// method allowlist
 	s.app.Use(func(c fiber.Ctx) error {
-		c.Set("Access-Control-Allow-Origin", "*")
-		c.Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		c.Set("Access-Control-Allow-Headers", "Content-Type")
-		if c.Method() == "OPTIONS" {
-			return c.SendStatus(204)
+		m := c.Method()
+		if m != "GET" && m != "HEAD" && m != "OPTIONS" {
+			return c.Status(405).JSON(fiber.Map{"error": "method not allowed"})
 		}
 		return c.Next()
 	})
+
+	// rate limit: 60 req/min per IP. uses real client IP via KeyGenerator.
+	s.app.Use(limiter.New(limiter.Config{
+		Max:        60,
+		Expiration: 1 * time.Minute,
+		KeyGenerator: func(c fiber.Ctx) string {
+			return s.clientIP(c)
+		},
+		LimitReached: func(c fiber.Ctx) error {
+			c.Set("Retry-After", "60")
+			return c.Status(429).JSON(fiber.Map{"error": "rate limited"})
+		},
+	}))
+
+	// response cache: 3s TTL, only on the read endpoints we want cached.
+	// /health stays uncached so monitors get fresh state.
+	cacheMW := cache.New(cache.Config{
+		Expiration: 3 * time.Second,
+		Methods:    []string{fiber.MethodGet, fiber.MethodHead},
+		Next: func(c fiber.Ctx) bool {
+			// skip cache for /health
+			return c.Path() == "/health"
+		},
+	})
+	s.app.Use(cacheMW)
 
 	s.app.Get("/health", s.handleHealth)
 	s.app.Get("/positions", s.handleAllPositions)
 	s.app.Get("/positions/curated", s.handleCurated)
 	s.app.Get("/positions/owner/:addr", s.handleByOwner)
+
+	// catch-all 404
+	s.app.Use(func(c fiber.Ctx) error {
+		return c.Status(404).JSON(fiber.Map{"error": "not found"})
+	})
 }
 
 func (s *Server) Listen(port int) error {
-	addr := fmt.Sprintf(":%d", port)
-	return s.app.Listen(addr)
+	host := os.Getenv("GRENADIER_BIND")
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	return s.app.Listen(fmt.Sprintf("%s:%d", host, port))
 }
 
 func (s *Server) Shutdown() error {
@@ -60,6 +134,7 @@ func (s *Server) Shutdown() error {
 
 func (s *Server) handleHealth(c fiber.Ctx) error {
 	count, _ := s.st.Count()
+	c.Set("Cache-Control", "no-store")
 	return c.JSON(fiber.Map{
 		"ok":        true,
 		"positions": count,
@@ -104,6 +179,37 @@ func (s *Server) handleByOwner(c fiber.Ctx) error {
 	})
 }
 
+// ----------------------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------------------
+
+// clientIP returns the real client IP, accounting for proxy hops.
+// trust order: CF-Connecting-IP > X-Real-IP > X-Forwarded-For[len-hops] > socket
+func (s *Server) clientIP(c fiber.Ctx) string {
+	if s.proxyHops > 0 {
+		if cf := c.Get("CF-Connecting-IP"); cf != "" {
+			return cf
+		}
+		if xr := c.Get("X-Real-IP"); xr != "" {
+			return xr
+		}
+		if xff := c.Get(fiber.HeaderXForwardedFor); xff != "" {
+			parts := strings.Split(xff, ",")
+			for i := range parts {
+				parts[i] = strings.TrimSpace(parts[i])
+			}
+			idx := len(parts) - s.proxyHops
+			if idx < 0 {
+				idx = 0
+			}
+			if parts[idx] != "" {
+				return parts[idx]
+			}
+		}
+	}
+	return c.IP()
+}
+
 func isAddrLike(s string) bool {
 	if !strings.HasPrefix(s, "0x") || len(s) != 42 {
 		return false
@@ -114,4 +220,18 @@ func isAddrLike(s string) bool {
 		}
 	}
 	return true
+}
+
+func atoiDefault(s string, def int) int {
+	if s == "" {
+		return def
+	}
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return def
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
 }

@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	tickInterval  = 15 * time.Second
+	tickInterval  = 12 * time.Second
 	maxBlockRange = 2000 // safe for almost every public RPC
 	safetyDepth   = 5    // don't index up to head — reorg margin
 	overlap       = 10   // re-scan last N blocks each tick for extra safety

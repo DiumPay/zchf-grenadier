@@ -1,0 +1,22 @@
+# build artifacts
+zchf-grenadier
+grenadier
+*.exe
+
+# local data
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# git + editor
+.git/
+.gitignore
+.vscode/
+.idea/
+*.swp
+
+# docs
+README.md
+LICENSE
+*.md
