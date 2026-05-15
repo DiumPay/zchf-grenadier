@@ -13,19 +13,21 @@ import (
 	"github.com/gofiber/fiber/v3/middleware/limiter"
 	"github.com/gofiber/fiber/v3/middleware/recover"
 
+	"github.com/DiumPay/zchf-grenadier/chain"
 	"github.com/DiumPay/zchf-grenadier/store"
 )
 
 type Server struct {
 	app *fiber.App
 	st  *store.Store
+	pc  *chain.PriceCache
 	// callback to get last scanned block (avoids circular import to indexer)
 	lastBlockFn func() uint64
 	// trusted proxy hops: 1 for caddy only, 2 for cloudflare -> caddy
 	proxyHops int
 }
 
-func New(st *store.Store, lastBlockFn func() uint64) *Server {
+func New(st *store.Store, pc *chain.PriceCache, lastBlockFn func() uint64) *Server {
 	app := fiber.New(fiber.Config{
 		AppName:       "grenadier",
 		StrictRouting: false,
@@ -40,6 +42,7 @@ func New(st *store.Store, lastBlockFn func() uint64) *Server {
 	s := &Server{
 		app:         app,
 		st:          st,
+		pc:          pc,
 		lastBlockFn: lastBlockFn,
 		proxyHops:   atoiDefault(os.Getenv("GRENADIER_PROXY_HOPS"), 1),
 	}
@@ -109,6 +112,14 @@ func (s *Server) routes() {
 	s.app.Get("/positions", s.handleAllPositions)
 	s.app.Get("/positions/curated", s.handleCurated)
 	s.app.Get("/positions/owner/:addr", s.handleByOwner)
+	s.app.Get("/challenges", s.handleAllChallenges)
+	s.app.Get("/challenges/active", s.handleActiveChallenges)
+	s.app.Get("/challenges/challenger/:addr", s.handleChallengesByChallenger)
+	s.app.Get("/challenges/position/:addr", s.handleChallengesByPosition)
+	s.app.Get("/bids/bidder/:addr", s.handleBidsByBidder)
+	s.app.Get("/bids/position/:addr", s.handleBidsByPosition)
+	s.app.Get("/prices/list", s.handlePricesList)
+	s.app.Get("/prices/ticker/:sym", s.handlePriceTicker)
 
 	// catch-all 404
 	s.app.Use(func(c fiber.Ctx) error {
@@ -134,11 +145,15 @@ func (s *Server) Shutdown() error {
 
 func (s *Server) handleHealth(c fiber.Ctx) error {
 	count, _ := s.st.Count()
+	chalCount, _ := s.st.ChallengeCount()
+	bidCount, _ := s.st.BidCount()
 	c.Set("Cache-Control", "no-store")
 	return c.JSON(fiber.Map{
-		"ok":        true,
-		"positions": count,
-		"lastBlock": s.lastBlockFn(),
+		"ok":         true,
+		"positions":  count,
+		"challenges": chalCount,
+		"bids":       bidCount,
+		"lastBlock":  s.lastBlockFn(),
 	})
 }
 
@@ -177,6 +192,94 @@ func (s *Server) handleByOwner(c fiber.Ctx) error {
 		"num":  len(positions),
 		"list": positions,
 	})
+}
+
+// ---- challenges ----
+
+func (s *Server) handleAllChallenges(c fiber.Ctx) error {
+	list, err := s.st.AllChallenges()
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"num": len(list), "list": list})
+}
+
+func (s *Server) handleActiveChallenges(c fiber.Ctx) error {
+	list, err := s.st.ActiveChallenges()
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"num": len(list), "list": list})
+}
+
+func (s *Server) handleChallengesByChallenger(c fiber.Ctx) error {
+	addr := strings.ToLower(c.Params("addr"))
+	if !isAddrLike(addr) {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid address"})
+	}
+	list, err := s.st.ChallengesByChallenger(addr)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"num": len(list), "list": list})
+}
+
+func (s *Server) handleChallengesByPosition(c fiber.Ctx) error {
+	addr := strings.ToLower(c.Params("addr"))
+	if !isAddrLike(addr) {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid address"})
+	}
+	list, err := s.st.ChallengesByPosition(addr)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"num": len(list), "list": list})
+}
+
+// ---- bids ----
+
+func (s *Server) handleBidsByBidder(c fiber.Ctx) error {
+	addr := strings.ToLower(c.Params("addr"))
+	if !isAddrLike(addr) {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid address"})
+	}
+	list, err := s.st.BidsByBidder(addr)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"num": len(list), "list": list})
+}
+
+func (s *Server) handleBidsByPosition(c fiber.Ctx) error {
+	addr := strings.ToLower(c.Params("addr"))
+	if !isAddrLike(addr) {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid address"})
+	}
+	list, err := s.st.BidsByPosition(addr)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"num": len(list), "list": list})
+}
+
+// ---- prices (lazy passthrough from api.frankencoin.com for the 5 illiquid tokens) ----
+
+func (s *Server) handlePricesList(c fiber.Ctx) error {
+	m := s.pc.All(c.Context())
+	list := make([]*chain.Price, 0, len(m))
+	for _, p := range m {
+		list = append(list, p)
+	}
+	return c.JSON(fiber.Map{"num": len(list), "list": list})
+}
+
+func (s *Server) handlePriceTicker(c fiber.Ctx) error {
+	sym := strings.ToUpper(c.Params("sym"))
+	p := s.pc.Get(c.Context(), sym)
+	if p == nil {
+		return c.Status(404).JSON(fiber.Map{"error": "ticker not tracked or unavailable"})
+	}
+	return c.JSON(p)
 }
 
 // ----------------------------------------------------------------------------

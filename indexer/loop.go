@@ -82,7 +82,7 @@ func (ix *Indexer) tick(ctx context.Context) {
 		from -= overlap // re-scan recent window for reorg safety
 	}
 
-	var newCount, refreshCount int
+	var newCount, refreshCount, chalCount int
 	for from <= target {
 		to := from + maxBlockRange
 		if to > target {
@@ -103,6 +103,13 @@ func (ix *Indexer) tick(ctx context.Context) {
 		}
 		refreshCount += n2
 
+		n3, err := ScanChallenges(ctx, ix.ch, ix.st, from, to)
+		if err != nil {
+			fmt.Printf("[tick] challenges [%d,%d]: %v\n", from, to, err)
+			return
+		}
+		chalCount += n3
+
 		from = to + 1
 	}
 
@@ -111,9 +118,9 @@ func (ix *Indexer) tick(ctx context.Context) {
 		return
 	}
 
-	if newCount > 0 || refreshCount > 0 {
-		fmt.Printf("[tick] %d new, %d refreshed, block %d, took %v\n",
-			newCount, refreshCount, target, time.Since(t0))
+	if newCount > 0 || refreshCount > 0 || chalCount > 0 {
+		fmt.Printf("[tick] %d new, %d refreshed, %d challenge events, block %d, took %v\n",
+			newCount, refreshCount, chalCount, target, time.Since(t0))
 	}
 }
 

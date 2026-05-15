@@ -56,6 +56,10 @@ func run() error {
 	// 3. chain client
 	ch := chain.New(rpc)
 
+	// 3b. price cache (lazy, in-memory, 60s TTL — fetches from
+	// api.frankencoin.com only when someone asks for a stale price)
+	pc := chain.NewPriceCache()
+
 	// graceful shutdown context
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -76,6 +80,14 @@ func run() error {
 	}
 	bootCancel()
 
+	// 4b. challenge bootstrap — fetches once from api.frankencoin.com (V2 only).
+	// Failure is non-fatal: marker gets set to head, tick watches forward.
+	chalCtx, chalCancel := context.WithTimeout(ctx, 90*time.Second)
+	if err := indexer.BootstrapChallenges(chalCtx, st, ch); err != nil {
+		fmt.Printf("[main] bootstrap challenges: %v\n", err)
+	}
+	chalCancel()
+
 	count, _ := st.Count()
 	lastBlock, _ := st.GetLastBlock()
 	fmt.Printf("[main] ready: %d positions, last block %d\n", count, lastBlock)
@@ -85,7 +97,7 @@ func run() error {
 	go ix.Run(ctx)
 
 	// 6. http server
-	srv := api.New(st, ix.LastBlock)
+	srv := api.New(st, pc, ix.LastBlock)
 	go func() {
 		fmt.Printf("[main] http server on :%d\n", config.HTTPPort)
 		if err := srv.Listen(config.HTTPPort); err != nil {
