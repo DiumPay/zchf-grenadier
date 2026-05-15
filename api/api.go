@@ -83,41 +83,57 @@ func (s *Server) routes() {
 		return c.Next()
 	})
 
-	// rate limit: 60 req/min per IP. uses real client IP via KeyGenerator.
+	// Rate limiting: two layers, both keyed on real client IP.
+	//   - Burst:     20 req per 5s   → tolerates a page load hitting multiple endpoints
+	//   - Sustained: 300 req per 5m  → caps long-running scrapers below ~1 req/s avg
+	// Bots that get past one limit hit the other. Genuine users stay well under both.
 	s.app.Use(limiter.New(limiter.Config{
-		Max:        60,
-		Expiration: 1 * time.Minute,
+		Max:        20,
+		Expiration: 5 * time.Second,
 		KeyGenerator: func(c fiber.Ctx) string {
-			return s.clientIP(c)
+			return "burst:" + s.clientIP(c)
+		},
+		LimitReached: func(c fiber.Ctx) error {
+			c.Set("Retry-After", "5")
+			return c.Status(429).JSON(fiber.Map{"error": "rate limited (burst)"})
+		},
+	}))
+	s.app.Use(limiter.New(limiter.Config{
+		Max:        300,
+		Expiration: 5 * time.Minute,
+		KeyGenerator: func(c fiber.Ctx) string {
+			return "sustained:" + s.clientIP(c)
 		},
 		LimitReached: func(c fiber.Ctx) error {
 			c.Set("Retry-After", "60")
-			return c.Status(429).JSON(fiber.Map{"error": "rate limited"})
+			return c.Status(429).JSON(fiber.Map{"error": "rate limited (sustained)"})
 		},
 	}))
 
-	// response cache: 3s TTL, only on the read endpoints we want cached.
-	// /health stays uncached so monitors get fresh state.
-	cacheMW := cache.New(cache.Config{
-		Expiration: 3 * time.Second,
-		Methods:    []string{fiber.MethodGet, fiber.MethodHead},
-		Next: func(c fiber.Ctx) bool {
-			// skip cache for /health
-			return c.Path() == "/health"
-		},
-	})
-	s.app.Use(cacheMW)
+	// Per-route response caches. TTL chosen by how often the underlying data
+	// actually changes:
+	//   - curated:    rare (new position = governance event), 2 min
+	//   - positions:  occasional updates, 30s
+	//   - owner:      user wants their own changes visible quickly, 15s
+	//   - challenges: zero turnover today, 60s
+	//   - bids:       append-only history, 60s
+	//   - prices:     no http cache — PriceCache already holds 60s in memory
+	//   - health:     no cache — monitors need ground truth
+	cacheCurated := cache.New(cache.Config{Expiration: 120 * time.Second, Methods: []string{fiber.MethodGet, fiber.MethodHead}})
+	cachePositions := cache.New(cache.Config{Expiration: 30 * time.Second, Methods: []string{fiber.MethodGet, fiber.MethodHead}})
+	cacheOwner := cache.New(cache.Config{Expiration: 15 * time.Second, Methods: []string{fiber.MethodGet, fiber.MethodHead}})
+	cacheChalBids := cache.New(cache.Config{Expiration: 60 * time.Second, Methods: []string{fiber.MethodGet, fiber.MethodHead}})
 
 	s.app.Get("/health", s.handleHealth)
-	s.app.Get("/positions", s.handleAllPositions)
-	s.app.Get("/positions/curated", s.handleCurated)
-	s.app.Get("/positions/owner/:addr", s.handleByOwner)
-	s.app.Get("/challenges", s.handleAllChallenges)
-	s.app.Get("/challenges/active", s.handleActiveChallenges)
-	s.app.Get("/challenges/challenger/:addr", s.handleChallengesByChallenger)
-	s.app.Get("/challenges/position/:addr", s.handleChallengesByPosition)
-	s.app.Get("/bids/bidder/:addr", s.handleBidsByBidder)
-	s.app.Get("/bids/position/:addr", s.handleBidsByPosition)
+	s.app.Get("/positions", cachePositions, s.handleAllPositions)
+	s.app.Get("/positions/curated", cacheCurated, s.handleCurated)
+	s.app.Get("/positions/owner/:addr", cacheOwner, s.handleByOwner)
+	s.app.Get("/challenges", cacheChalBids, s.handleAllChallenges)
+	s.app.Get("/challenges/active", cacheChalBids, s.handleActiveChallenges)
+	s.app.Get("/challenges/challenger/:addr", cacheChalBids, s.handleChallengesByChallenger)
+	s.app.Get("/challenges/position/:addr", cacheChalBids, s.handleChallengesByPosition)
+	s.app.Get("/bids/bidder/:addr", cacheChalBids, s.handleBidsByBidder)
+	s.app.Get("/bids/position/:addr", cacheChalBids, s.handleBidsByPosition)
 	s.app.Get("/prices/list", s.handlePricesList)
 	s.app.Get("/prices/ticker/:sym", s.handlePriceTicker)
 
