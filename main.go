@@ -88,6 +88,16 @@ func run() error {
 	}
 	chalCancel()
 
+	// 4c. governance bootstrap — pulls minters / leadrate from api.frankencoin.com
+	// and FPS holders / delegations from ponder.frankencoin.com. Snapshot-style:
+	// each refresh tick replaces the tables, so failure here is non-fatal —
+	// the periodic refresh loop will retry.
+	govCtx, govCancel := context.WithTimeout(ctx, 90*time.Second)
+	if err := indexer.BootstrapGovernance(govCtx, st); err != nil {
+		fmt.Printf("[main] bootstrap governance: %v\n", err)
+	}
+	govCancel()
+
 	count, _ := st.Count()
 	lastBlock, _ := st.GetLastBlock()
 	fmt.Printf("[main] ready: %d positions, last block %d\n", count, lastBlock)
@@ -95,6 +105,10 @@ func run() error {
 	// 5. indexer (the tick loop)
 	ix := indexer.New(ch, st)
 	go ix.Run(ctx)
+
+	// 5b. governance refresh loop — pulls every 5 min from frankencoin api +
+	// ponder. Independent of the chain indexer; no shared state besides store.
+	go indexer.RunGovernanceRefresh(ctx, st)
 
 	// 6. http server
 	srv := api.New(st, pc, ix.LastBlock)

@@ -123,6 +123,9 @@ func (s *Server) routes() {
 	cachePositions := cache.New(cache.Config{Expiration: 30 * time.Second, Methods: []string{fiber.MethodGet, fiber.MethodHead}})
 	cacheOwner := cache.New(cache.Config{Expiration: 15 * time.Second, Methods: []string{fiber.MethodGet, fiber.MethodHead}})
 	cacheChalBids := cache.New(cache.Config{Expiration: 60 * time.Second, Methods: []string{fiber.MethodGet, fiber.MethodHead}})
+	// Governance data refreshes every 5 min upstream, so a 60s HTTP cache
+	// gives us "fresh enough" without hammering the DB for repeated reads.
+	cacheGovernance := cache.New(cache.Config{Expiration: 60 * time.Second, Methods: []string{fiber.MethodGet, fiber.MethodHead}})
 
 	s.app.Get("/health", s.handleHealth)
 	s.app.Get("/positions", cachePositions, s.handleAllPositions)
@@ -136,6 +139,12 @@ func (s *Server) routes() {
 	s.app.Get("/bids/position/:addr", cacheChalBids, s.handleBidsByPosition)
 	s.app.Get("/prices/list", s.handlePricesList)
 	s.app.Get("/prices/ticker/:sym", s.handlePriceTicker)
+	// Governance — single composite endpoint by default, plus drill-downs.
+	s.app.Get("/governance", cacheGovernance, s.handleGovernance)
+	s.app.Get("/governance/minters", cacheGovernance, s.handleGovernanceMinters)
+	s.app.Get("/governance/leadrate", cacheGovernance, s.handleGovernanceLeadrate)
+	s.app.Get("/governance/fps-holders", cacheGovernance, s.handleGovernanceFPSHolders)
+	s.app.Get("/governance/delegations", cacheGovernance, s.handleGovernanceDelegations)
 
 	// catch-all 404
 	s.app.Use(func(c fiber.Ctx) error {
@@ -163,13 +172,19 @@ func (s *Server) handleHealth(c fiber.Ctx) error {
 	count, _ := s.st.Count()
 	chalCount, _ := s.st.ChallengeCount()
 	bidCount, _ := s.st.BidCount()
+	minterCount, _ := s.st.MinterCount()
+	fpsCount, _ := s.st.FPSHolderCount()
+	delegationCount, _ := s.st.DelegationCount()
 	c.Set("Cache-Control", "no-store")
 	return c.JSON(fiber.Map{
-		"ok":         true,
-		"positions":  count,
-		"challenges": chalCount,
-		"bids":       bidCount,
-		"lastBlock":  s.lastBlockFn(),
+		"ok":          true,
+		"positions":   count,
+		"challenges":  chalCount,
+		"bids":        bidCount,
+		"minters":     minterCount,
+		"fpsHolders":  fpsCount,
+		"delegations": delegationCount,
+		"lastBlock":   s.lastBlockFn(),
 	})
 }
 
@@ -296,6 +311,91 @@ func (s *Server) handlePriceTicker(c fiber.Ctx) error {
 		return c.Status(404).JSON(fiber.Map{"error": "ticker not tracked or unavailable"})
 	}
 	return c.JSON(p)
+}
+
+// ---- governance ----
+
+// handleGovernance is a one-shot endpoint that returns everything the
+// frontend needs to render the page in a single round-trip. The pieces are
+// also exposed individually below for clients that want finer control.
+func (s *Server) handleGovernance(c fiber.Ctx) error {
+	minters, err := s.st.AllMinters()
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	approved, err := s.st.AllLeadrateApproved()
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	proposed, err := s.st.AllLeadrateProposed()
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	holders, err := s.st.FPSHoldersTop(20)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	delegations, err := s.st.AllDelegations()
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{
+		"minters": fiber.Map{
+			"num":  len(minters),
+			"list": minters,
+		},
+		"leadrate": fiber.Map{
+			"approved": fiber.Map{"num": len(approved), "list": approved},
+			"proposed": fiber.Map{"num": len(proposed), "list": proposed},
+		},
+		"fpsHolders": fiber.Map{
+			"num":  len(holders),
+			"list": holders,
+		},
+		"delegations": fiber.Map{
+			"num":  len(delegations),
+			"list": delegations,
+		},
+	})
+}
+
+func (s *Server) handleGovernanceMinters(c fiber.Ctx) error {
+	list, err := s.st.AllMinters()
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"num": len(list), "list": list})
+}
+
+func (s *Server) handleGovernanceLeadrate(c fiber.Ctx) error {
+	approved, err := s.st.AllLeadrateApproved()
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	proposed, err := s.st.AllLeadrateProposed()
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{
+		"approved": fiber.Map{"num": len(approved), "list": approved},
+		"proposed": fiber.Map{"num": len(proposed), "list": proposed},
+	})
+}
+
+func (s *Server) handleGovernanceFPSHolders(c fiber.Ctx) error {
+	list, err := s.st.FPSHoldersTop(20)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"num": len(list), "list": list})
+}
+
+func (s *Server) handleGovernanceDelegations(c fiber.Ctx) error {
+	list, err := s.st.AllDelegations()
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"num": len(list), "list": list})
 }
 
 // ----------------------------------------------------------------------------
