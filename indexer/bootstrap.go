@@ -4,16 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
 	"time"
 
 	"github.com/DiumPay/zchf-grenadier/chain"
 	"github.com/DiumPay/zchf-grenadier/store"
 )
-
-const frankencoinAPI = "https://api.frankencoin.com/positions/list"
 
 type apiPosition struct {
 	Version              int         `json:"version"`
@@ -55,8 +51,9 @@ type apiResponse struct {
 	List []apiPosition `json:"list"`
 }
 
-// Bootstrap seeds the store from frankencoin's api the first time we run.
-// Skips if the store already has positions.
+// Bootstrap seeds the store from the peer list the first time we run.
+// Skips if the store already has positions. Tries each configured peer
+// in order (your own grenadiers first, official as fallback).
 func Bootstrap(ctx context.Context, st *store.Store, ch *chain.Client) error {
 	count, err := st.Count()
 	if err != nil {
@@ -67,32 +64,13 @@ func Bootstrap(ctx context.Context, st *store.Store, ch *chain.Client) error {
 		return nil
 	}
 
-	fmt.Println("[bootstrap] fetching from frankencoin api...")
+	fmt.Println("[bootstrap] fetching positions from peer list...")
 	t0 := time.Now()
 
-	hctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(hctx, "GET", frankencoinAPI, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("bootstrap http %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
 	var api apiResponse
-	if err := json.Unmarshal(body, &api); err != nil {
-		return err
+	source, err := FetchAndDecodeFromPeers(ctx, EndpointPositions, 30*time.Second, &api)
+	if err != nil {
+		return fmt.Errorf("bootstrap positions: %w", err)
 	}
 
 	positions := make([]*store.Position, 0, len(api.List))
@@ -115,8 +93,8 @@ func Bootstrap(ctx context.Context, st *store.Store, ch *chain.Client) error {
 		return err
 	}
 
-	fmt.Printf("[bootstrap] seeded %d positions in %v, resuming from block %d\n",
-		len(positions), time.Since(t0), blockNum)
+	fmt.Printf("[bootstrap] seeded %d positions from %s in %v, resuming from block %d\n",
+		len(positions), source.Name, time.Since(t0), blockNum)
 	return nil
 }
 

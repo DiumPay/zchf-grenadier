@@ -29,6 +29,8 @@ positions.json
 .vscode/
 *.swp
 
-
 zchf-grenadier
 grenadier
+
+docker-compose.override.yml
+docker-compose.override.yaml

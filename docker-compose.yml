@@ -1,25 +1,16 @@
 services:
-  app:
-    platform: linux/arm64
+  grenadier:
     build:
       context: .
       dockerfile: dockerfile
     container_name: zchf_grenadier
-    expose:
-      - "8080"
+    ports:
+      - "8080:8080"
     volumes:
       - grenadier_data:/data
     environment:
       - GRENADIER_BIND=0.0.0.0
-      - GRENADIER_PROXY_HOPS=2
-    networks:
-      - default
-      - docker_pdns-network
     restart: unless-stopped
 
 volumes:
   grenadier_data:
-
-networks:
-  docker_pdns-network:
-    external: true

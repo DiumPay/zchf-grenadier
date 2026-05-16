@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -14,11 +12,7 @@ import (
 	"github.com/DiumPay/zchf-grenadier/store"
 )
 
-const (
-	apiChallengesURL = "https://api.frankencoin.com/challenges/list"
-	apiBidsURL       = "https://api.frankencoin.com/challenges/bids/list"
-	bootChalMarker   = "bootstrap_chal_block"
-)
+const bootChalMarker = "bootstrap_chal_block"
 
 // apiChallenge mirrors a row from /challenges/list. Number, start, created,
 // duration come back as strings — typed as json.Number so we can parse safely.
@@ -67,31 +61,28 @@ type apiBidList struct {
 	List []apiBid `json:"list"`
 }
 
-// BootstrapChallenges seeds challenges + bids from api.frankencoin.com once.
+// BootstrapChallenges seeds challenges + bids from the peer list once.
 // V2-only. Sets the tail marker to current head — tick takes over from there.
 //
 // Failure modes:
-//   - Empty store + API down → set marker to head, tick watches from now.
+//   - Empty store + all peers down → set marker to head, tick watches from now.
 //     Currently zero active challenges so this loses nothing.
-//   - Empty store + API up → seed historical V2 data, set marker.
+//   - Empty store + any peer up → seed historical V2 data, set marker.
 //   - Already seeded (marker set) → no-op.
 func BootstrapChallenges(ctx context.Context, st *store.Store, ch *chain.Client) error {
 	if v, _ := st.GetMeta(bootChalMarker); v != "" {
 		return nil // already bootstrapped, tick resumes from marker
 	}
 
-	// Always set the marker to head when we exit successfully, even if the
-	// API fetch fails — that way the tick scans forward from now instead of
-	// re-fetching from 2024.
 	head, err := ch.BlockNumber(ctx)
 	if err != nil {
 		return fmt.Errorf("bootstrap chal head: %w", err)
 	}
 
 	t0 := time.Now()
-	chalCount, bidCount, apiErr := seedFromAPI(ctx, st)
+	chalCount, bidCount, apiErr := seedFromPeers(ctx, st)
 	if apiErr != nil {
-		fmt.Printf("[bootstrap-chal] api fetch failed (%v) — starting fresh from block %d\n", apiErr, head)
+		fmt.Printf("[bootstrap-chal] peer fetch failed (%v) — starting fresh from block %d\n", apiErr, head)
 	} else {
 		fmt.Printf("[bootstrap-chal] seeded %d challenges, %d bids in %v (V2 only)\n",
 			chalCount, bidCount, time.Since(t0))
@@ -100,14 +91,17 @@ func BootstrapChallenges(ctx context.Context, st *store.Store, ch *chain.Client)
 	return st.SetMeta(bootChalMarker, strconv.FormatUint(head, 10))
 }
 
-func seedFromAPI(ctx context.Context, st *store.Store) (int, int, error) {
+func seedFromPeers(ctx context.Context, st *store.Store) (int, int, error) {
 	chalList, err := fetchChallenges(ctx)
 	if err != nil {
 		return 0, 0, fmt.Errorf("challenges: %w", err)
 	}
 	bidList, err := fetchBids(ctx)
 	if err != nil {
-		return 0, 0, fmt.Errorf("bids: %w", err)
+		// Non-fatal: challenges seeded but bids couldn't be. Better than
+		// nothing — tick will catch up bids forward from now.
+		fmt.Printf("[bootstrap-chal] bids unavailable from peers (%v) — skipping\n", err)
+		bidList = nil
 	}
 
 	chals := make([]*store.Challenge, 0, len(chalList))
@@ -137,54 +131,16 @@ func seedFromAPI(ctx context.Context, st *store.Store) (int, int, error) {
 }
 
 func fetchChallenges(ctx context.Context) ([]apiChallenge, error) {
-	hctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(hctx, "GET", apiChallengesURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
 	var out apiChallengeList
-	if err := json.Unmarshal(body, &out); err != nil {
+	if _, err := FetchAndDecodeFromPeers(ctx, EndpointChallenges, 30*time.Second, &out); err != nil {
 		return nil, err
 	}
 	return out.List, nil
 }
 
 func fetchBids(ctx context.Context) ([]apiBid, error) {
-	hctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(hctx, "GET", apiBidsURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
 	var out apiBidList
-	if err := json.Unmarshal(body, &out); err != nil {
+	if _, err := FetchAndDecodeFromPeers(ctx, EndpointBids, 30*time.Second, &out); err != nil {
 		return nil, err
 	}
 	return out.List, nil

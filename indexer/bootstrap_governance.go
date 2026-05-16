@@ -8,18 +8,12 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/DiumPay/zchf-grenadier/store"
 )
 
 const (
-	apiMinterListURL        = "https://api.frankencoin.com/ecosystem/minter/list"
-	apiLeadrateRatesURL     = "https://api.frankencoin.com/savings/leadrate/rates"
-	apiLeadrateProposalsURL = "https://api.frankencoin.com/savings/leadrate/proposals"
-	ponderURL               = "https://ponder.frankencoin.com"
-
 	equityAddress = "0x1ba26788dfde592fec8bcb0eaff472a42be341b2"
 
 	// Hard cap on number of FPS holders we keep. Their UI shows 20; we
@@ -79,7 +73,6 @@ func refreshGovernanceOnce(ctx context.Context, st *store.Store) error {
 		err  error
 	}
 	results := make(chan result, 4)
-
 	go func() {
 		results <- result{"minters", fetchAndStoreMinters(ctx, st)}
 	}()
@@ -92,7 +85,6 @@ func refreshGovernanceOnce(ctx context.Context, st *store.Store) error {
 	go func() {
 		results <- result{"delegations", fetchAndStoreDelegations(ctx, st)}
 	}()
-
 	var firstErr error
 	for i := 0; i < 4; i++ {
 		r := <-results
@@ -105,6 +97,10 @@ func refreshGovernanceOnce(ctx context.Context, st *store.Store) error {
 
 // ---------------- minters ----------------
 
+// apiMinterEntry matches the official /ecosystem/minter/list shape. Optional
+// fields use *string for null vs empty distinction. When the same response
+// comes from a grenadier peer (which emits "" for missing values, not null),
+// the pointer still decodes correctly — empty string is just empty string.
 type apiMinterEntry struct {
 	ChainID           int     `json:"chainId"`
 	TxHash            string  `json:"txHash"`
@@ -126,13 +122,9 @@ type apiMinterList struct {
 }
 
 func fetchAndStoreMinters(ctx context.Context, st *store.Store) error {
-	body, err := httpGetJSON(ctx, apiMinterListURL)
-	if err != nil {
-		return err
-	}
 	var resp apiMinterList
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return fmt.Errorf("unmarshal: %w", err)
+	if _, err := FetchAndDecodeFromPeers(ctx, EndpointMinters, 30*time.Second, &resp); err != nil {
+		return err
 	}
 	out := make([]*store.Minter, 0, len(resp.List))
 	for i := range resp.List {
@@ -165,21 +157,19 @@ func fetchAndStoreMinters(ctx context.Context, st *store.Store) error {
 }
 
 // ---------------- leadrate ----------------
-
-// The leadrate API returns a deeply nested shape:
 //
-//	{
-//	  "rate":     {chainId: {module: <single approved>}},
-//	  "list":     {chainId: {module: [history...]}}    // for approved
-//	}
+// Two source shapes:
 //
-//	and for proposals:
-//	{
-//	  "proposed": {chainId: {module: <single pending>}},
-//	  "list":     {chainId: {module: [history...]}}
-//	}
+//   - Official api.frankencoin.com — two endpoints, nested:
+//     /savings/leadrate/rates      → {list: {chainId: {module: [rows...]}}}
+//     /savings/leadrate/proposals  → {list: {chainId: {module: [rows...]}}}
 //
-// We only care about `list` from each — it's a superset of `rate`/`proposed`.
+//   - Grenadier peer — one combined endpoint, flat:
+//     /governance/leadrate → {approved: {num, list:[...]}, proposed: {num, list:[...]}}
+//
+// Try grenadier peer(s) first (single round-trip), fall back to official
+// (two parallel round-trips). Decoded rows are normalised before storage
+// so consumers see the same store types either way.
 
 type apiLeadrateRow struct {
 	ChainID      int    `json:"chainId"`
@@ -194,43 +184,102 @@ type apiLeadrateRow struct {
 	NextRate     int    `json:"nextRate,omitempty"`   // proposed endpoint
 }
 
+// Grenadier combined-response shape.
+type grenadierLeadrateResp struct {
+	Approved struct {
+		List []*store.LeadrateApproved `json:"list"`
+	} `json:"approved"`
+	Proposed struct {
+		List []*store.LeadrateProposed `json:"list"`
+	} `json:"proposed"`
+}
+
+// Official nested response shape.
 type apiLeadrateRatesResp struct {
 	List map[string]map[string][]apiLeadrateRow `json:"list"`
 }
-
 type apiLeadrateProposalsResp struct {
 	List map[string]map[string][]apiLeadrateRow `json:"list"`
 }
 
 func fetchAndStoreLeadrate(ctx context.Context, st *store.Store) error {
-	// Fetch both endpoints in parallel.
+	// Try each peer in order. First successful response wins.
+	var lastErr error
+	for _, p := range IterPeers() {
+		switch p.Kind {
+		case PeerGrenadier:
+			if err := fetchLeadrateFromGrenadier(ctx, st, p); err == nil {
+				return nil
+			} else {
+				lastErr = fmt.Errorf("grenadier %s: %w", p.Name, err)
+				fmt.Printf("[peer] %s /governance/leadrate -> %v\n", p.Name, err)
+			}
+		case PeerOfficial:
+			if err := fetchLeadrateFromOfficial(ctx, st, p); err == nil {
+				return nil
+			} else {
+				lastErr = fmt.Errorf("official %s: %w", p.Name, err)
+				fmt.Printf("[peer] %s /savings/leadrate/* -> %v\n", p.Name, err)
+			}
+		case PeerPonder:
+			continue // not a leadrate source
+		}
+	}
+	if lastErr == nil {
+		return fmt.Errorf("no leadrate source available")
+	}
+	return lastErr
+}
+
+func fetchLeadrateFromGrenadier(ctx context.Context, st *store.Store, p Peer) error {
+	body, err := httpGetWithTimeout(ctx, p.Base+"/governance/leadrate", 30*time.Second)
+	if err != nil {
+		return err
+	}
+	var resp grenadierLeadrateResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return fmt.Errorf("unmarshal: %w", err)
+	}
+	if err := st.BulkUpsertLeadrateApproved(resp.Approved.List); err != nil {
+		return fmt.Errorf("store approved: %w", err)
+	}
+	if err := st.BulkUpsertLeadrateProposed(resp.Proposed.List); err != nil {
+		return fmt.Errorf("store proposed: %w", err)
+	}
+	fmt.Printf("[peer] %s /governance/leadrate -> ok (%d approved, %d proposed)\n",
+		p.Name, len(resp.Approved.List), len(resp.Proposed.List))
+	return nil
+}
+
+func fetchLeadrateFromOfficial(ctx context.Context, st *store.Store, p Peer) error {
+	// Two endpoints in parallel.
 	type fetchResult struct {
 		body []byte
 		err  error
-		url  string
+		kind string // "rates" or "proposals"
 	}
 	ch := make(chan fetchResult, 2)
-	for _, u := range []string{apiLeadrateRatesURL, apiLeadrateProposalsURL} {
-		u := u
-		go func() {
-			b, e := httpGetJSON(ctx, u)
-			ch <- fetchResult{b, e, u}
-		}()
-	}
+	go func() {
+		b, e := httpGetWithTimeout(ctx, p.Base+"/savings/leadrate/rates", 30*time.Second)
+		ch <- fetchResult{b, e, "rates"}
+	}()
+	go func() {
+		b, e := httpGetWithTimeout(ctx, p.Base+"/savings/leadrate/proposals", 30*time.Second)
+		ch <- fetchResult{b, e, "proposals"}
+	}()
 	var ratesBody, propsBody []byte
 	for i := 0; i < 2; i++ {
 		r := <-ch
 		if r.err != nil {
-			return fmt.Errorf("fetch %s: %w", r.url, r.err)
+			return fmt.Errorf("fetch %s: %w", r.kind, r.err)
 		}
-		if strings.Contains(r.url, "/rates") {
+		if r.kind == "rates" {
 			ratesBody = r.body
 		} else {
 			propsBody = r.body
 		}
 	}
 
-	// approved
 	var rates apiLeadrateRatesResp
 	if err := json.Unmarshal(ratesBody, &rates); err != nil {
 		return fmt.Errorf("unmarshal rates: %w", err)
@@ -255,7 +304,6 @@ func fetchAndStoreLeadrate(ctx context.Context, st *store.Store) error {
 		return fmt.Errorf("store approved: %w", err)
 	}
 
-	// proposed
 	var props apiLeadrateProposalsResp
 	if err := json.Unmarshal(propsBody, &props); err != nil {
 		return fmt.Errorf("unmarshal proposals: %w", err)
@@ -281,16 +329,194 @@ func fetchAndStoreLeadrate(ctx context.Context, st *store.Store) error {
 	if err := st.BulkUpsertLeadrateProposed(proposed); err != nil {
 		return fmt.Errorf("store proposed: %w", err)
 	}
+	fmt.Printf("[peer] %s /savings/leadrate/* -> ok (%d approved, %d proposed)\n",
+		p.Name, len(approved), len(proposed))
 	return nil
 }
 
-// ---------------- ponder graphql ----------------
+// ---------------- FPS holders + delegations ----------------
 //
-// Ponder responds with GraphQL JSON. Errors come back in `errors[]`. Pagination
-// uses cursor-based `after`/`pageInfo`. The two queries we run here both fit
-// well under any one-page result for FPS — there are <200 unique balance rows
-// for the Equity token and far fewer active delegations — but we still loop
-// the cursor to stay robust if that ever changes.
+// Two source shapes:
+//
+//   - Grenadier peer — REST GET, returns {num, list:[...]} with the same
+//     store types we use internally. One round-trip per endpoint.
+//
+//   - Ponder GraphQL — POST with cursor pagination, different JSON shape.
+//
+// Try grenadier first (simpler, faster), fall back to ponder.
+
+func fetchAndStoreFPSHolders(ctx context.Context, st *store.Store) error {
+	var lastErr error
+	for _, p := range IterPeers() {
+		switch p.Kind {
+		case PeerGrenadier:
+			if err := fetchFPSHoldersFromGrenadier(ctx, st, p); err == nil {
+				return nil
+			} else {
+				lastErr = fmt.Errorf("grenadier %s: %w", p.Name, err)
+				fmt.Printf("[peer] %s /governance/fps-holders -> %v\n", p.Name, err)
+			}
+		case PeerPonder:
+			if err := fetchFPSHoldersFromPonder(ctx, st, p); err == nil {
+				return nil
+			} else {
+				lastErr = fmt.Errorf("ponder %s: %w", p.Name, err)
+				fmt.Printf("[peer] %s graphql -> %v\n", p.Name, err)
+			}
+		case PeerOfficial:
+			continue // not an FPS source
+		}
+	}
+	if lastErr == nil {
+		return fmt.Errorf("no FPS source available")
+	}
+	return lastErr
+}
+
+func fetchFPSHoldersFromGrenadier(ctx context.Context, st *store.Store, p Peer) error {
+	body, err := httpGetWithTimeout(ctx, p.Base+"/governance/fps-holders", 30*time.Second)
+	if err != nil {
+		return err
+	}
+	var resp struct {
+		List []*store.FPSHolder `json:"list"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return fmt.Errorf("unmarshal: %w", err)
+	}
+	fmt.Printf("[peer] %s /governance/fps-holders -> ok (%d holders)\n", p.Name, len(resp.List))
+	return st.BulkUpsertFPSHolders(resp.List)
+}
+
+func fetchFPSHoldersFromPonder(ctx context.Context, st *store.Store, p Peer) error {
+	q := `query($token: String!, $limit: Int!) {
+        eRC20BalanceMappings(
+            where: { token: $token },
+            orderBy: "balance",
+            orderDirection: "desc",
+            limit: $limit
+        ) {
+            items { account balance updated }
+            pageInfo { hasNextPage endCursor }
+        }
+    }`
+	body, err := ponderQueryAt(ctx, p.Base, q, map[string]any{
+		"token": equityAddress,
+		"limit": fpsHolderLimit,
+	})
+	if err != nil {
+		return err
+	}
+	var resp ponderBalancesResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return fmt.Errorf("unmarshal: %w", err)
+	}
+	if len(resp.Errors) > 0 {
+		return fmt.Errorf("graphql: %s", resp.Errors[0].Message)
+	}
+	out := make([]*store.FPSHolder, 0, len(resp.Data.ERC20BalanceMappings.Items))
+	for _, it := range resp.Data.ERC20BalanceMappings.Items {
+		if it.Balance == "" || it.Balance == "0" {
+			continue
+		}
+		updated, _ := strconv.ParseInt(it.Updated, 10, 64)
+		out = append(out, &store.FPSHolder{
+			Account: it.Account,
+			Balance: it.Balance,
+			Updated: updated,
+		})
+	}
+	fmt.Printf("[peer] %s graphql FPS -> ok (%d holders)\n", p.Name, len(out))
+	return st.BulkUpsertFPSHolders(out)
+}
+
+func fetchAndStoreDelegations(ctx context.Context, st *store.Store) error {
+	var lastErr error
+	for _, p := range IterPeers() {
+		switch p.Kind {
+		case PeerGrenadier:
+			if err := fetchDelegationsFromGrenadier(ctx, st, p); err == nil {
+				return nil
+			} else {
+				lastErr = fmt.Errorf("grenadier %s: %w", p.Name, err)
+				fmt.Printf("[peer] %s /governance/delegations -> %v\n", p.Name, err)
+			}
+		case PeerPonder:
+			if err := fetchDelegationsFromPonder(ctx, st, p); err == nil {
+				return nil
+			} else {
+				lastErr = fmt.Errorf("ponder %s: %w", p.Name, err)
+				fmt.Printf("[peer] %s graphql delegations -> %v\n", p.Name, err)
+			}
+		case PeerOfficial:
+			continue // not a delegations source
+		}
+	}
+	if lastErr == nil {
+		return fmt.Errorf("no delegations source available")
+	}
+	return lastErr
+}
+
+func fetchDelegationsFromGrenadier(ctx context.Context, st *store.Store, p Peer) error {
+	body, err := httpGetWithTimeout(ctx, p.Base+"/governance/delegations", 30*time.Second)
+	if err != nil {
+		return err
+	}
+	var resp struct {
+		List []*store.EquityDelegation `json:"list"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return fmt.Errorf("unmarshal: %w", err)
+	}
+	fmt.Printf("[peer] %s /governance/delegations -> ok (%d edges)\n", p.Name, len(resp.List))
+	return st.BulkUpsertDelegations(resp.List)
+}
+
+func fetchDelegationsFromPonder(ctx context.Context, st *store.Store, p Peer) error {
+	all := []*store.EquityDelegation{}
+	var after string
+	for {
+		q := `query($after: String) {
+            equityDelegations(after: $after, limit: 100) {
+                items { owner delegatedTo }
+                pageInfo { hasNextPage endCursor }
+            }
+        }`
+		vars := map[string]any{}
+		if after != "" {
+			vars["after"] = after
+		}
+		body, err := ponderQueryAt(ctx, p.Base, q, vars)
+		if err != nil {
+			return err
+		}
+		var resp ponderDelegationsResp
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return fmt.Errorf("unmarshal: %w", err)
+		}
+		if len(resp.Errors) > 0 {
+			return fmt.Errorf("graphql: %s", resp.Errors[0].Message)
+		}
+		for _, it := range resp.Data.EquityDelegations.Items {
+			all = append(all, &store.EquityDelegation{
+				Owner:       it.Owner,
+				DelegatedTo: it.DelegatedTo,
+			})
+		}
+		if !resp.Data.EquityDelegations.PageInfo.HasNextPage {
+			break
+		}
+		after = resp.Data.EquityDelegations.PageInfo.EndCursor
+		if after == "" {
+			break
+		}
+	}
+	fmt.Printf("[peer] %s graphql delegations -> ok (%d edges)\n", p.Name, len(all))
+	return st.BulkUpsertDelegations(all)
+}
+
+// ---------------- ponder graphql wire types ----------------
 
 type ponderGqlReq struct {
 	Query     string         `json:"query"`
@@ -320,53 +546,6 @@ type ponderBalancesResp struct {
 	} `json:"errors,omitempty"`
 }
 
-func fetchAndStoreFPSHolders(ctx context.Context, st *store.Store) error {
-	// Ponder lets us filter by token contract directly — equity is FPS.
-	// We sort desc by balance and cap at fpsHolderLimit.
-	q := `query($token: String!, $limit: Int!) {
-		eRC20BalanceMappings(
-			where: { token: $token },
-			orderBy: "balance",
-			orderDirection: "desc",
-			limit: $limit
-		) {
-			items { account balance updated }
-			pageInfo { hasNextPage endCursor }
-		}
-	}`
-	body, err := ponderQuery(ctx, q, map[string]any{
-		"token": equityAddress,
-		"limit": fpsHolderLimit,
-	})
-	if err != nil {
-		return err
-	}
-	var resp ponderBalancesResp
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return fmt.Errorf("unmarshal: %w", err)
-	}
-	if len(resp.Errors) > 0 {
-		return fmt.Errorf("graphql: %s", resp.Errors[0].Message)
-	}
-	out := make([]*store.FPSHolder, 0, len(resp.Data.ERC20BalanceMappings.Items))
-	for _, it := range resp.Data.ERC20BalanceMappings.Items {
-		// Drop dust holders — ponder includes anyone who's ever held FPS,
-		// including zero-balance rows from when someone sold everything.
-		if it.Balance == "" || it.Balance == "0" {
-			continue
-		}
-		// `updated` is a BigInt in ponder (unix sec). Parse defensively;
-		// 0 on failure is fine — we don't rely on it for ordering.
-		updated, _ := strconv.ParseInt(it.Updated, 10, 64)
-		out = append(out, &store.FPSHolder{
-			Account: it.Account,
-			Balance: it.Balance,
-			Updated: updated,
-		})
-	}
-	return st.BulkUpsertFPSHolders(out)
-}
-
 type ponderDelegationItem struct {
 	Owner       string `json:"owner"`
 	DelegatedTo string `json:"delegatedTo"`
@@ -384,84 +563,22 @@ type ponderDelegationsResp struct {
 	} `json:"errors,omitempty"`
 }
 
-func fetchAndStoreDelegations(ctx context.Context, st *store.Store) error {
-	// Walk the cursor — delegations table is small but we paginate
-	// defensively in case it grows.
-	all := []*store.EquityDelegation{}
-	var after string
-	for {
-		q := `query($after: String) {
-			equityDelegations(after: $after, limit: 100) {
-				items { owner delegatedTo }
-				pageInfo { hasNextPage endCursor }
-			}
-		}`
-		vars := map[string]any{}
-		if after != "" {
-			vars["after"] = after
-		}
-		body, err := ponderQuery(ctx, q, vars)
-		if err != nil {
-			return err
-		}
-		var resp ponderDelegationsResp
-		if err := json.Unmarshal(body, &resp); err != nil {
-			return fmt.Errorf("unmarshal: %w", err)
-		}
-		if len(resp.Errors) > 0 {
-			return fmt.Errorf("graphql: %s", resp.Errors[0].Message)
-		}
-		for _, it := range resp.Data.EquityDelegations.Items {
-			all = append(all, &store.EquityDelegation{
-				Owner:       it.Owner,
-				DelegatedTo: it.DelegatedTo,
-			})
-		}
-		if !resp.Data.EquityDelegations.PageInfo.HasNextPage {
-			break
-		}
-		after = resp.Data.EquityDelegations.PageInfo.EndCursor
-		if after == "" {
-			break // defensive — shouldn't happen if hasNextPage=true
-		}
-	}
-	return st.BulkUpsertDelegations(all)
-}
-
-// ---------------- http helpers ----------------
-
-func httpGetJSON(ctx context.Context, url string) ([]byte, error) {
-	hctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(hctx, "GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	return io.ReadAll(resp.Body)
-}
-
-func ponderQuery(ctx context.Context, query string, vars map[string]any) ([]byte, error) {
+// ponderQueryAt — POST a GraphQL request to the given ponder base URL.
+// Accepts a base so callers can switch peers without state.
+func ponderQueryAt(ctx context.Context, base, query string, vars map[string]any) ([]byte, error) {
 	payload, err := json.Marshal(ponderGqlReq{Query: query, Variables: vars})
 	if err != nil {
 		return nil, err
 	}
 	hctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(hctx, "POST", ponderURL, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(hctx, "POST", base, bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "grenadier/bootstrap")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
