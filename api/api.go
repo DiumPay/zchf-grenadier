@@ -130,6 +130,7 @@ func (s *Server) routes() {
 	s.app.Get("/health", s.handleHealth)
 	s.app.Get("/positions", cachePositions, s.handleAllPositions)
 	s.app.Get("/positions/curated", cacheCurated, s.handleCurated)
+	s.app.Get("/positions/monitored", cachePositions, s.handleMonitored)
 	s.app.Get("/positions/owner/:addr", cacheOwner, s.handleByOwner)
 	s.app.Get("/challenges", cacheChalBids, s.handleAllChallenges)
 	s.app.Get("/challenges/active", cacheChalBids, s.handleActiveChallenges)
@@ -201,6 +202,17 @@ func (s *Server) handleAllPositions(c fiber.Ctx) error {
 
 func (s *Server) handleCurated(c fiber.Ctx) error {
 	positions, err := s.st.Curated()
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{
+		"num":  len(positions),
+		"list": positions,
+	})
+}
+
+func (s *Server) handleMonitored(c fiber.Ctx) error {
+	positions, err := s.st.Monitored()
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
