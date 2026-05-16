@@ -78,8 +78,8 @@ func (s *Store) migrateChallenges() error {
 // ---------------- challenges ----------------
 
 func (s *Store) UpsertChallenge(c *Challenge, block int64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 
 	c.Challenger = strings.ToLower(c.Challenger)
 	c.Position = strings.ToLower(c.Position)
@@ -106,8 +106,8 @@ func (s *Store) BulkUpsertChallenges(list []*Challenge, block int64) error {
 	if len(list) == 0 {
 		return nil
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -146,8 +146,6 @@ func (s *Store) BulkUpsertChallenges(list []*Challenge, block int64) error {
 
 // GetChallenge returns nil, nil if not found.
 func (s *Store) GetChallenge(id string) (*Challenge, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	var blob string
 	err := s.db.QueryRow(`SELECT data FROM challenges WHERE id = ?`, id).Scan(&blob)
 	if err == sql.ErrNoRows {
@@ -180,16 +178,12 @@ func (s *Store) AllChallenges() ([]*Challenge, error) {
 }
 
 func (s *Store) ChallengeCount() (int, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	var n int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM challenges`).Scan(&n)
 	return n, err
 }
 
 func (s *Store) queryChallenges(query string, args ...any) ([]*Challenge, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
@@ -213,8 +207,8 @@ func (s *Store) queryChallenges(query string, args ...any) ([]*Challenge, error)
 // ---------------- bids ----------------
 
 func (s *Store) UpsertBid(b *Bid) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 
 	b.Bidder = strings.ToLower(b.Bidder)
 	b.Position = strings.ToLower(b.Position)
@@ -240,8 +234,8 @@ func (s *Store) BulkUpsertBids(list []*Bid) error {
 	if len(list) == 0 {
 		return nil
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -286,16 +280,12 @@ func (s *Store) BidsByPosition(addr string) ([]*Bid, error) {
 }
 
 func (s *Store) BidCount() (int, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	var n int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM bids`).Scan(&n)
 	return n, err
 }
 
 func (s *Store) queryBids(query string, args ...any) ([]*Bid, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err

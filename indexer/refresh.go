@@ -6,24 +6,34 @@ import (
 	"strings"
 
 	"github.com/DiumPay/zchf-grenadier/chain"
-	"github.com/DiumPay/zchf-grenadier/store"
 )
 
 // Refresh scans MintingUpdate + PositionDenied across all known positions
 // and re-hydrates any that emitted events in [from, to].
 func Refresh(
 	ctx context.Context,
-	ch *chain.Client,
-	st *store.Store,
-	collateralMeta map[string]chain.ERC20Meta,
+	ix *Indexer,
 	from, to uint64,
 ) (int, error) {
-	logs, err := ch.GetLogs(ctx, chain.LogFilter{
-		FromBlock: from,
-		ToBlock:   to,
-		Topics: [][]string{
-			{chain.TopicMintingUpdate, chain.TopicPositionDenied},
-		},
+	ch, st, collateralMeta := ix.ch, ix.st, ix.collateralMeta
+
+	// Scope getLogs by the known position address set so the RPC returns only
+	// events from contracts we care about. Previously this pulled every
+	// MintingUpdate on mainnet and discarded ~all of them client-side.
+	addrs, err := ix.KnownAddresses()
+	if err != nil {
+		return 0, fmt.Errorf("refresh: load addrs: %w", err)
+	}
+	if len(addrs) == 0 {
+		return 0, nil
+	}
+
+	// Chunk addresses for getLogs: most public RPCs cap the address list
+	// around 1024 entries (some lower). Issue parallel-by-chunk calls and
+	// merge.
+	const addrChunk = 500
+	logs, err := getLogsChunked(ctx, ch, from, to, addrs, addrChunk, []string{
+		chain.TopicMintingUpdate, chain.TopicPositionDenied,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("refresh getLogs: %w", err)
@@ -42,12 +52,8 @@ func Refresh(
 		}
 	}
 
-	// Only re-hydrate addresses we already know
-	known := make(map[string]bool)
-	addrs, err := st.AllAddresses()
-	if err != nil {
-		return 0, err
-	}
+	// Safety net: belt-and-suspenders in case an RPC ignores the address filter.
+	known := make(map[string]bool, len(addrs))
 	for _, a := range addrs {
 		known[a] = true
 	}

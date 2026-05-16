@@ -11,6 +11,10 @@ import (
 	"github.com/DiumPay/zchf-grenadier/store"
 )
 
+// bigE18 = 10^18, the ZCHF scaling factor. Cached so the per-bid math in
+// handleAverted / handleSucceeded doesn't allocate three big.Ints per call.
+var bigE18 = new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
+
 // ScanChallenges pulls ChallengeStarted/Averted/Succeeded in [from, to] in one
 // log call, resolves bidders via batched eth_getBlockByNumber, and writes
 // challenge + bid rows.
@@ -129,12 +133,15 @@ func handleStarted(ctx context.Context, ch *chain.Client, st *store.Store, log c
 	size := new(big.Int).SetBytes(data[0:32])
 	number := new(big.Int).SetBytes(data[32:64]).Uint64()
 
-	// Read the position's challengePeriod + liqPrice. Best-effort: if the
-	// position isn't hydrated yet we leave both at 0 and a later refresh
-	// fills them in.
+	// ChallengePeriod + Price are written into the position row by Refresh
+	// earlier in this same tick. Hit the store first; fall back to chain
+	// only for positions not yet hydrated (early-bootstrap race).
 	var duration int64
 	var liqPrice string
-	if pos, _ := ch.HydratePosition(ctx, position, nil); pos != nil {
+	if pos, _ := st.GetPosition(position); pos != nil {
+		duration = pos.ChallengePeriod
+		liqPrice = pos.Price
+	} else if pos, _ := ch.HydratePosition(ctx, position, nil); pos != nil {
 		duration = pos.ChallengePeriod
 		liqPrice = pos.Price
 	}
@@ -209,7 +216,7 @@ func handleAverted(st *store.Store, log chain.Log, bidder string) error {
 		lp := new(big.Int)
 		if _, ok := lp.SetString(cur.LiqPrice, 10); ok {
 			b := new(big.Int).Mul(size, lp)
-			b.Quo(b, big.NewInt(0).Exp(big.NewInt(10), big.NewInt(18), nil))
+			b.Quo(b, bigE18)
 			bidAmt = b.String()
 		}
 	}
@@ -293,8 +300,7 @@ func handleSucceeded(st *store.Store, log chain.Log, bidder string) error {
 	price := "0"
 	if acquired.Sign() > 0 {
 		// price * acquired / 1e18 = bid → price = bid * 1e18 / acquired
-		e18 := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
-		p := new(big.Int).Mul(bidAmt, e18)
+		p := new(big.Int).Mul(bidAmt, bigE18)
 		p.Quo(p, acquired)
 		price = p.String()
 	}

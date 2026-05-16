@@ -6,18 +6,16 @@ import (
 	"strings"
 
 	"github.com/DiumPay/zchf-grenadier/chain"
-	"github.com/DiumPay/zchf-grenadier/store"
 )
 
 // Discover scans MintingHubV2 for new PositionOpened events in [from, to]
 // and hydrates each new position into the store.
 func Discover(
 	ctx context.Context,
-	ch *chain.Client,
-	st *store.Store,
-	collateralMeta map[string]chain.ERC20Meta,
+	ix *Indexer,
 	from, to uint64,
 ) (int, error) {
+	ch, st, collateralMeta := ix.ch, ix.st, ix.collateralMeta
 	logs, err := ch.GetLogs(ctx, chain.LogFilter{
 		FromBlock: from,
 		ToBlock:   to,
@@ -59,6 +57,9 @@ func Discover(
 			continue
 		}
 		count++
+	}
+	if count > 0 {
+		ix.MarkKnownDirty() // address set changed → Refresh reloads next call
 	}
 	return count, nil
 }

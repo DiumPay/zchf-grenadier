@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -47,16 +48,35 @@ type Position struct {
 	Minted               string `json:"minted"`
 }
 
+// Store wraps the SQLite handle.
+//
+// Concurrency: SQLite (WAL) handles many concurrent readers + one writer at
+// the file level; database/sql manages the connection pool. Reads take no
+// Go-level lock. writeMu serializes write paths so bursts can't trip
+// SQLITE_BUSY and to make the contract explicit.
 type Store struct {
-	db *sql.DB
-	mu sync.RWMutex
+	db      *sql.DB
+	writeMu sync.Mutex
 }
 
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite3", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	// Pragmas:
+	//   journal_mode(WAL)  — concurrent readers + one writer
+	//   busy_timeout(5000) — wait up to 5s on contention before SQLITE_BUSY
+	//   cache_size(-64000) — 64 MiB page cache (negative units = KiB)
+	//   temp_store(MEMORY) — keep temp tables off disk
+	//   synchronous: left at default (FULL). Do not relax: durability gate.
+	db, err := sql.Open("sqlite3", "file:"+path+
+		"?_pragma=journal_mode(WAL)"+
+		"&_pragma=busy_timeout(5000)"+
+		"&_pragma=cache_size(-64000)"+
+		"&_pragma=temp_store(MEMORY)")
 	if err != nil {
 		return nil, err
 	}
+	// SQLite serializes writes at the file level; a small pool is correct.
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(4)
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
 		return nil, err
@@ -94,8 +114,8 @@ func (s *Store) migrate() error {
 }
 
 func (s *Store) Upsert(p *Position, block int64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 
 	p.Position = strings.ToLower(p.Position)
 	p.Owner = strings.ToLower(p.Owner)
@@ -128,8 +148,8 @@ func (s *Store) Upsert(p *Position, block int64) error {
 }
 
 func (s *Store) BulkUpsert(positions []*Position, block int64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -175,9 +195,6 @@ func (s *Store) BulkUpsert(positions []*Position, block int64) error {
 }
 
 func (s *Store) All() ([]*Position, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	rows, err := s.db.Query(`SELECT data FROM positions`)
 	if err != nil {
 		return nil, err
@@ -199,10 +216,70 @@ func (s *Store) All() ([]*Position, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) ByOwner(owner string) ([]*Position, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+// GetPosition returns nil, nil if not found.
+// Used by the challenge indexer to read ChallengePeriod / Price without an
+// 18-call multicall — the row was already written this tick by Refresh.
+func (s *Store) GetPosition(addr string) (*Position, error) {
+	var blob string
+	err := s.db.QueryRow(`SELECT data FROM positions WHERE position = ?`, strings.ToLower(addr)).Scan(&blob)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	p := &Position{}
+	if err := json.Unmarshal([]byte(blob), p); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
 
+// AllRaw returns stored blobs without unmarshal/remarshal. /positions just
+// re-emits them; parsing to structs and back is wasted work.
+func (s *Store) AllRaw() ([]json.RawMessage, error) {
+	rows, err := s.db.Query(`SELECT data FROM positions`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []json.RawMessage{}
+	for rows.Next() {
+		var blob []byte
+		if err := rows.Scan(&blob); err != nil {
+			return nil, err
+		}
+		cp := make(json.RawMessage, len(blob)) // copy: driver may reuse buffer
+		copy(cp, blob)
+		out = append(out, cp)
+	}
+	return out, rows.Err()
+}
+
+// AllLive: positions that are not closed and not denied. The predicate is
+// pushed to SQL so dead rows never get parsed for the live-set endpoints.
+func (s *Store) AllLive() ([]*Position, error) {
+	rows, err := s.db.Query(`SELECT data FROM positions WHERE closed = 0 AND denied = 0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*Position{}
+	for rows.Next() {
+		var blob string
+		if err := rows.Scan(&blob); err != nil {
+			return nil, err
+		}
+		p := &Position{}
+		if err := json.Unmarshal([]byte(blob), p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ByOwner(owner string) ([]*Position, error) {
 	rows, err := s.db.Query(`SELECT data FROM positions WHERE owner = ?`, strings.ToLower(owner))
 	if err != nil {
 		return nil, err
@@ -225,9 +302,6 @@ func (s *Store) ByOwner(owner string) ([]*Position, error) {
 }
 
 func (s *Store) AllAddresses() ([]string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	rows, err := s.db.Query(`SELECT position FROM positions`)
 	if err != nil {
 		return nil, err
@@ -246,8 +320,6 @@ func (s *Store) AllAddresses() ([]string, error) {
 }
 
 func (s *Store) Count() (int, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	var n int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM positions`).Scan(&n)
 	return n, err
@@ -256,8 +328,6 @@ func (s *Store) Count() (int, error) {
 // --- meta (last scanned block, etc) ---
 
 func (s *Store) GetMeta(k string) (string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	var v string
 	err := s.db.QueryRow(`SELECT v FROM meta WHERE k = ?`, k).Scan(&v)
 	if err == sql.ErrNoRows {
@@ -267,8 +337,8 @@ func (s *Store) GetMeta(k string) (string, error) {
 }
 
 func (s *Store) SetMeta(k, v string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	_, err := s.db.Exec(`
 		INSERT INTO meta(k, v) VALUES (?, ?)
 		ON CONFLICT(k) DO UPDATE SET v=excluded.v
@@ -281,9 +351,11 @@ func (s *Store) GetLastBlock() (uint64, error) {
 	if err != nil || v == "" {
 		return 0, err
 	}
-	var n uint64
-	_, err = fmt.Sscanf(v, "%d", &n)
-	return n, err
+	n, perr := strconv.ParseUint(v, 10, 64)
+	if perr != nil {
+		return 0, perr
+	}
+	return n, nil
 }
 
 func (s *Store) SetLastBlock(n uint64) error {

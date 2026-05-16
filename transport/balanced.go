@@ -173,6 +173,7 @@ type Balancer struct {
 
 	mu            sync.RWMutex
 	endpoints     []*endpoint
+	byURL         map[string]*endpoint // O(1) lookup; same lifetime as endpoints
 	stickyURL     string
 	stickyExpires time.Time
 	lastBlock     uint64
@@ -185,8 +186,9 @@ type Balancer struct {
 }
 
 type cacheEntry struct {
-	value   json.RawMessage
-	expires time.Time
+	value         json.RawMessage
+	expires       time.Time
+	headSensitive bool // true ⇒ purge on new head, false ⇒ stable across blocks
 }
 
 // New creates a balancer. Pool must be non-empty.
@@ -213,8 +215,11 @@ func New(cfg Config) *Balancer {
 		cache:  make(map[string]cacheEntry, 256),
 	}
 	b.endpoints = make([]*endpoint, len(cfg.Pool))
+	b.byURL = make(map[string]*endpoint, len(cfg.Pool))
 	for i, u := range cfg.Pool {
-		b.endpoints[i] = &endpoint{url: u, latEWMA: 800}
+		e := &endpoint{url: u, latEWMA: 800}
+		b.endpoints[i] = e
+		b.byURL[u] = e
 	}
 	return b
 }
@@ -224,17 +229,24 @@ func New(cfg Config) *Balancer {
 // ---------------------------------------------------------------------------
 
 func (b *Balancer) score(e *endpoint, tip uint64) float64 {
+	return b.scoreAt(e, tip, time.Now())
+}
+
+// scoreAt: same as score, but with caller-supplied `now`. weightedSample
+// pins `now` once across an entire sampling pass so all candidates are
+// judged against the same instant and we don't pay for time.Now() N times.
+func (b *Balancer) scoreAt(e *endpoint, tip uint64, now time.Time) float64 {
 	lat := 1.0 / (1.0 + e.latEWMA)
 	ok := 1.0 - e.errEWMA
 	if ok < 0 {
 		ok = 0
 	}
 	healthy := 1.0
-	if time.Now().Before(e.breakerUntil) {
+	if now.Before(e.breakerUntil) {
 		healthy = 0.01
 	}
 	freshness := 1.0
-	if tip > 0 && e.lastBlockSeen > 0 && time.Since(e.lastBlockSeenAt) < 30*time.Second {
+	if tip > 0 && e.lastBlockSeen > 0 && now.Sub(e.lastBlockSeenAt) < 30*time.Second {
 		if e.lastBlockSeen+b.cfg.StalenessPenalty < tip {
 			behind := float64(tip - e.lastBlockSeen)
 			freshness = 1.0 / (1.0 + (behind-float64(b.cfg.StalenessPenalty))*0.5)
@@ -253,29 +265,45 @@ func (b *Balancer) weightedSample(pool []*endpoint, k int, tip uint64) []*endpoi
 	if k <= 0 {
 		return nil
 	}
-	items := make([]*endpoint, len(pool))
-	copy(items, pool)
+	// Score every candidate once against a single `now`; sample without
+	// replacement by decrementing total as we pick. No slice shifting,
+	// no repeated time.Now().
+	now := time.Now()
+	scores := make([]float64, len(pool))
+	var total float64
+	for i, e := range pool {
+		scores[i] = b.scoreAt(e, tip, now)
+		total += scores[i]
+	}
+	chosen := make([]bool, len(pool))
 	out := make([]*endpoint, 0, k)
-
-	for i := 0; i < k && len(items) > 0; i++ {
-		total := 0.0
-		for _, it := range items {
-			total += b.score(it, tip)
+	for picked := 0; picked < k; picked++ {
+		if total <= 0 {
+			// Degenerate: all-zero scores (every endpoint penalized). Fall
+			// back to picking the first remaining candidate so the caller
+			// still gets a racer.
+			for i, c := range chosen {
+				if !c {
+					out = append(out, pool[i])
+					chosen[i] = true
+					break
+				}
+			}
+			continue
 		}
 		r := rand.Float64() * total
-		idx := 0
-		for idx < len(items) {
-			r -= b.score(items[idx], tip)
+		for i, s := range scores {
+			if chosen[i] {
+				continue
+			}
+			r -= s
 			if r <= 0 {
+				out = append(out, pool[i])
+				chosen[i] = true
+				total -= s
 				break
 			}
-			idx++
 		}
-		if idx >= len(items) {
-			idx = len(items) - 1
-		}
-		out = append(out, items[idx])
-		items = append(items[:idx], items[idx+1:]...)
 	}
 	return out
 }
@@ -287,10 +315,7 @@ func (b *Balancer) weightedSample(pool []*endpoint, k int, tip uint64) []*endpoi
 func (b *Balancer) recordWin(url string, latency time.Duration, method string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for _, e := range b.endpoints {
-		if e.url != url {
-			continue
-		}
+	if e := b.byURL[url]; e != nil {
 		latMs := float64(latency.Milliseconds())
 		e.latEWMA = e.latEWMA*(1-b.cfg.EWMAAlpha) + latMs*b.cfg.EWMAAlpha
 		e.errEWMA = e.errEWMA * (1 - b.cfg.EWMAAlpha)
@@ -305,7 +330,6 @@ func (b *Balancer) recordWin(url string, latency time.Duration, method string) {
 				go b.cfg.OnBreaker(url, false)
 			}
 		}
-		break
 	}
 	b.stickyURL = url
 	b.stickyExpires = time.Now().Add(b.cfg.StickyTTL)
@@ -321,10 +345,7 @@ func (b *Balancer) recordFail(url string, method string, err error) {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for _, e := range b.endpoints {
-		if e.url != url {
-			continue
-		}
+	if e := b.byURL[url]; e != nil {
 		e.errEWMA = e.errEWMA*(1-b.cfg.EWMAAlpha) + 1.0*b.cfg.EWMAAlpha
 		e.wins = 0
 		var rpcErr *rpcError
@@ -343,7 +364,6 @@ func (b *Balancer) recordFail(url string, method string, err error) {
 				go b.cfg.OnBreaker(url, true)
 			}
 		}
-		break
 	}
 	if b.stickyURL == url {
 		b.stickyURL = ""
@@ -371,12 +391,9 @@ func (b *Balancer) recordBlockResp(url, method string, result json.RawMessage) {
 		return
 	}
 	b.mu.Lock()
-	for _, e := range b.endpoints {
-		if e.url == url {
-			e.lastBlockSeen = n
-			e.lastBlockSeenAt = time.Now()
-			break
-		}
+	if e := b.byURL[url]; e != nil {
+		e.lastBlockSeen = n
+		e.lastBlockSeenAt = time.Now()
 	}
 	prev := b.lastBlock
 	if n > b.lastBlock {
@@ -385,10 +402,16 @@ func (b *Balancer) recordBlockResp(url, method string, result json.RawMessage) {
 	}
 	b.mu.Unlock()
 
-	// New block → drop cache (block-aware invalidation)
+	// New block → only purge entries marked head-sensitive. Stable entries
+	// (chainId, receipts, ERC20 metadata, historical eth_call) survive and
+	// continue to satisfy CallTTL.
 	if b.cfg.BlockAwareCache && n != prev {
 		b.cacheMu.Lock()
-		b.cache = make(map[string]cacheEntry, 256)
+		for k, ce := range b.cache {
+			if ce.headSensitive {
+				delete(b.cache, k)
+			}
+		}
 		b.cacheMu.Unlock()
 	}
 }
@@ -619,9 +642,66 @@ var neverCache = map[string]bool{
 	"eth_feeHistory":           true,
 }
 
+// isHeadSensitive: does the result of this call change when a new block lands?
+// Conservative default = true. Only return false for calls whose result is
+// fixed once recorded on-chain (chainId, receipts, code, historical reads).
+func isHeadSensitive(method string, params any) bool {
+	switch method {
+	case "eth_chainId", "net_version":
+		return false
+	case "eth_getTransactionReceipt", "eth_getTransactionByHash",
+		"eth_getTransactionByBlockHashAndIndex",
+		"eth_getTransactionByBlockNumberAndIndex":
+		return false
+	case "eth_getBlockByHash":
+		return false
+	case "eth_getBlockByNumber":
+		// Sensitive only when asking for "latest" / "pending" / "earliest" / empty.
+		if arr, ok := params.([]any); ok && len(arr) >= 1 {
+			if tag, ok := arr[0].(string); ok {
+				switch tag {
+				case "", "latest", "pending", "earliest", "finalized", "safe":
+					return tag != "finalized" && tag != "safe" // finalized/safe move slowly; treat as stable
+				}
+				// Hex block number → fixed history.
+				return false
+			}
+		}
+		return true
+	case "eth_call", "eth_getStorageAt", "eth_getCode", "eth_getBalance",
+		"eth_getTransactionCount":
+		// Sensitive iff blockTag is latest/pending (or unset for eth_call).
+		// Look at last param (block tag is conventionally the last arg).
+		if arr, ok := params.([]any); ok && len(arr) >= 1 {
+			if tag, ok := arr[len(arr)-1].(string); ok {
+				return tag == "" || tag == "latest" || tag == "pending"
+			}
+		}
+		return true
+	case "eth_getLogs":
+		if arr, ok := params.([]any); ok && len(arr) >= 1 {
+			if m, ok := arr[0].(map[string]any); ok {
+				tb, _ := m["toBlock"].(string)
+				return tb == "" || tb == "latest" || tb == "pending"
+			}
+		}
+		return true
+	}
+	return true
+}
+
+// keyBufPool: cacheKey is on every cacheable RPC call. The old version did
+// json.Marshal (alloc) + string concat (alloc); this reuses a buffer.
+var keyBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
 func (b *Balancer) cacheKey(method string, params any) string {
-	pb, _ := json.Marshal(params)
-	return method + "|" + string(pb)
+	buf := keyBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer keyBufPool.Put(buf)
+	buf.WriteString(method)
+	buf.WriteByte('|')
+	_ = json.NewEncoder(buf).Encode(params)
+	return buf.String()
 }
 
 func (b *Balancer) getCache(key string) (json.RawMessage, bool) {
@@ -634,24 +714,34 @@ func (b *Balancer) getCache(key string) (json.RawMessage, bool) {
 	return e.value, true
 }
 
-func (b *Balancer) putCache(key string, val json.RawMessage) {
+func (b *Balancer) putCache(key string, val json.RawMessage, headSensitive bool) {
 	b.cacheMu.Lock()
 	defer b.cacheMu.Unlock()
 	if len(b.cache) >= b.cfg.MaxCacheEntries {
-		// Cheap eviction: drop a random ~10% of entries
-		drop := b.cfg.MaxCacheEntries / 10
-		i := 0
-		for k := range b.cache {
-			if i >= drop {
-				break
+		// First: sweep expired entries (free eviction).
+		now := time.Now()
+		for k, e := range b.cache {
+			if now.After(e.expires) {
+				delete(b.cache, k)
 			}
-			delete(b.cache, k)
-			i++
+		}
+		// Still over → random-drop ~10%.
+		if len(b.cache) >= b.cfg.MaxCacheEntries {
+			drop := b.cfg.MaxCacheEntries / 10
+			i := 0
+			for k := range b.cache {
+				if i >= drop {
+					break
+				}
+				delete(b.cache, k)
+				i++
+			}
 		}
 	}
 	b.cache[key] = cacheEntry{
-		value:   val,
-		expires: time.Now().Add(b.cfg.CallTTL),
+		value:         val,
+		expires:       time.Now().Add(b.cfg.CallTTL),
+		headSensitive: headSensitive,
 	}
 }
 
@@ -682,6 +772,7 @@ func (b *Balancer) CallRaw(ctx context.Context, method string, params any) (json
 	if v, ok := b.getCache(key); ok {
 		return v, nil
 	}
+	hs := isHeadSensitive(method, params)
 
 	// singleflight: concurrent identical calls collapse to one network request.
 	// This is the go equivalent of the JS `inflight` map.
@@ -694,7 +785,7 @@ func (b *Balancer) CallRaw(ctx context.Context, method string, params any) (json
 		if err != nil {
 			return nil, err
 		}
-		b.putCache(key, raw)
+		b.putCache(key, raw, hs)
 		return raw, nil
 	})
 	if err != nil {

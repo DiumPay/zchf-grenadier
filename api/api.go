@@ -2,7 +2,10 @@ package api
 
 import (
 	"fmt"
+	"net"
 	"os"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +28,9 @@ type Server struct {
 	lastBlockFn func() uint64
 	// trusted proxy hops: 1 for caddy only, 2 for cloudflare -> caddy
 	proxyHops int
+	// CIDRs whose forwarded-IP headers we trust. Empty = trust loopback only.
+	// Configure via GRENADIER_TRUSTED_PROXIES="10.0.0.0/8,172.16.0.0/12".
+	trustedProxies []*net.IPNet
 }
 
 func New(st *store.Store, pc *chain.PriceCache, lastBlockFn func() uint64) *Server {
@@ -40,19 +46,60 @@ func New(st *store.Store, pc *chain.PriceCache, lastBlockFn func() uint64) *Serv
 	})
 
 	s := &Server{
-		app:         app,
-		st:          st,
-		pc:          pc,
-		lastBlockFn: lastBlockFn,
-		proxyHops:   atoiDefault(os.Getenv("GRENADIER_PROXY_HOPS"), 1),
+		app:            app,
+		st:             st,
+		pc:             pc,
+		lastBlockFn:    lastBlockFn,
+		proxyHops:      atoiDefault(os.Getenv("GRENADIER_PROXY_HOPS"), 1),
+		trustedProxies: defaultTrustedProxies(),
 	}
 	s.routes()
 	return s
 }
 
+// defaultTrustedProxies: zero-config trust list covering the deployments we
+// actually see — Cloudflare in front, Caddy/nginx on the same docker network,
+// reverse proxy on the same host. Operator can replace via GRENADIER_TRUSTED_PROXIES
+// (comma-separated CIDRs); otherwise this just works.
+func defaultTrustedProxies() []*net.IPNet {
+	if env := os.Getenv("GRENADIER_TRUSTED_PROXIES"); env != "" {
+		return parseCIDRs(env)
+	}
+	// RFC1918 private + loopback + Cloudflare published ranges (v4 + v6).
+	// Cloudflare list: https://www.cloudflare.com/ips/ — these change rarely
+	// (last update years apart); refresh by setting the env var if needed.
+	return parseCIDRs(strings.Join([]string{
+		// Private / loopback / link-local
+		"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+		"169.254.0.0/16", "::1/128", "fc00::/7", "fe80::/10",
+		// Cloudflare v4
+		"173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22",
+		"103.31.4.0/22", "141.101.64.0/18", "108.162.192.0/18",
+		"190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22",
+		"198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+		"104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+		// Cloudflare v6
+		"2400:cb00::/32", "2606:4700::/32", "2803:f800::/32",
+		"2405:b500::/32", "2405:8100::/32", "2a06:98c0::/29",
+		"2c0f:f248::/32",
+	}, ","))
+}
+
 func (s *Server) routes() {
-	// panic recovery: one bad request can't crash the server
-	s.app.Use(recover.New())
+	// panic recovery: one bad request can't crash the server. Stack handler
+	// surfaces what would otherwise be a silent 500.
+	s.app.Use(recover.New(recover.Config{
+		EnableStackTrace: true,
+		StackTraceHandler: func(c fiber.Ctx, e any) {
+			fmt.Printf("[panic] %s %s: %v\n%s\n", c.Method(), c.Path(), e, debug.Stack())
+		},
+	}))
+
+	// Strip Server header — minor obscurity, costs nothing.
+	s.app.Use(func(c fiber.Ctx) error {
+		c.Response().Header.Del("Server")
+		return c.Next()
+	})
 
 	// security headers
 	s.app.Use(helmet.New(helmet.Config{
@@ -73,6 +120,15 @@ func (s *Server) routes() {
 		ExposeHeaders: []string{"Content-Length"},
 		MaxAge:        86400,
 	}))
+
+	// URL guard: cheap pre-handler check. Anything pathological in path or
+	// query gets a 414 before we touch routing, CORS, or the limiter.
+	s.app.Use(func(c fiber.Ctx) error {
+		if len(c.Path())+len(c.Request().URI().QueryString()) > 2048 {
+			return c.Status(414).JSON(fiber.Map{"error": "uri too long"})
+		}
+		return c.Next()
+	})
 
 	// method allowlist
 	s.app.Use(func(c fiber.Ctx) error {
@@ -111,7 +167,16 @@ func (s *Server) routes() {
 	}))
 
 	// Per-route response caches. TTL chosen by how often the underlying data
-	// actually changes:
+	// actually changes (see comments below). MaxBytes caps memory so a
+	// flood of unique cache keys (e.g. per-owner) can't grow unbounded.
+	const cacheBudget = 16 * 1024 * 1024 // 16 MiB per route
+	mk := func(ttl time.Duration) fiber.Handler {
+		return cache.New(cache.Config{
+			Expiration: ttl,
+			MaxBytes:   cacheBudget,
+			Methods:    []string{fiber.MethodGet, fiber.MethodHead},
+		})
+	}
 	//   - curated:    rare (new position = governance event), 2 min
 	//   - positions:  occasional updates, 30s
 	//   - owner:      user wants their own changes visible quickly, 15s
@@ -119,13 +184,12 @@ func (s *Server) routes() {
 	//   - bids:       append-only history, 60s
 	//   - prices:     no http cache — PriceCache already holds 60s in memory
 	//   - health:     no cache — monitors need ground truth
-	cacheCurated := cache.New(cache.Config{Expiration: 120 * time.Second, Methods: []string{fiber.MethodGet, fiber.MethodHead}})
-	cachePositions := cache.New(cache.Config{Expiration: 30 * time.Second, Methods: []string{fiber.MethodGet, fiber.MethodHead}})
-	cacheOwner := cache.New(cache.Config{Expiration: 15 * time.Second, Methods: []string{fiber.MethodGet, fiber.MethodHead}})
-	cacheChalBids := cache.New(cache.Config{Expiration: 60 * time.Second, Methods: []string{fiber.MethodGet, fiber.MethodHead}})
-	// Governance data refreshes every 5 min upstream, so a 60s HTTP cache
-	// gives us "fresh enough" without hammering the DB for repeated reads.
-	cacheGovernance := cache.New(cache.Config{Expiration: 60 * time.Second, Methods: []string{fiber.MethodGet, fiber.MethodHead}})
+	//   - governance: 5 min upstream refresh; 60s here is fresh-enough.
+	cacheCurated := mk(120 * time.Second)
+	cachePositions := mk(30 * time.Second)
+	cacheOwner := mk(15 * time.Second)
+	cacheChalBids := mk(60 * time.Second)
+	cacheGovernance := mk(60 * time.Second)
 
 	s.app.Get("/health", s.handleHealth)
 	s.app.Get("/positions", cachePositions, s.handleAllPositions)
@@ -190,13 +254,15 @@ func (s *Server) handleHealth(c fiber.Ctx) error {
 }
 
 func (s *Server) handleAllPositions(c fiber.Ctx) error {
-	positions, err := s.st.All()
+	// Use AllRaw: the stored blobs are already the same JSON we'd emit, so
+	// we skip Position unmarshal + re-marshal entirely for this endpoint.
+	rows, err := s.st.AllRaw()
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
 	return c.JSON(fiber.Map{
-		"num":  len(positions),
-		"list": positions,
+		"num":  len(rows),
+		"list": rows,
 	})
 }
 
@@ -414,9 +480,24 @@ func (s *Server) handleGovernanceDelegations(c fiber.Ctx) error {
 // Helpers
 // ----------------------------------------------------------------------------
 
-// clientIP returns the real client IP, accounting for proxy hops.
-// trust order: CF-Connecting-IP > X-Real-IP > X-Forwarded-For[len-hops] > socket
+// clientIP returns the real client IP. Forwarded headers are honored only
+// when the immediate socket peer is in trustedProxies (Cloudflare CIDRs,
+// internal LB, etc). Otherwise an attacker hitting us directly could spoof
+// CF-Connecting-IP and bypass rate limits.
 func (s *Server) clientIP(c fiber.Ctx) string {
+	peer := net.ParseIP(c.IP())
+	trusted := peer != nil && peer.IsLoopback()
+	if !trusted && peer != nil {
+		for _, n := range s.trustedProxies {
+			if n.Contains(peer) {
+				trusted = true
+				break
+			}
+		}
+	}
+	if !trusted {
+		return c.IP() // ignore forwarded headers from untrusted peers
+	}
 	if s.proxyHops > 0 {
 		if cf := c.Get("CF-Connecting-IP"); cf != "" {
 			return cf
@@ -441,6 +522,25 @@ func (s *Server) clientIP(c fiber.Ctx) string {
 	return c.IP()
 }
 
+// parseCIDRs parses a comma-separated list of CIDR blocks. Invalid entries
+// are skipped silently — operator typo in the env shouldn't crash startup.
+func parseCIDRs(s string) []*net.IPNet {
+	if s == "" {
+		return nil
+	}
+	var out []*net.IPNet
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if _, n, err := net.ParseCIDR(part); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 func isAddrLike(s string) bool {
 	if !strings.HasPrefix(s, "0x") || len(s) != 42 {
 		return false
@@ -457,12 +557,9 @@ func atoiDefault(s string, def int) int {
 	if s == "" {
 		return def
 	}
-	n := 0
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return def
-		}
-		n = n*10 + int(c-'0')
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return def
 	}
 	return n
 }

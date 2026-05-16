@@ -121,8 +121,8 @@ func (s *Store) migrateGovernance() error {
 // ---------------- minters ----------------
 
 func (s *Store) BulkUpsertMinters(items []*Minter) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -167,8 +167,6 @@ func (s *Store) BulkUpsertMinters(items []*Minter) error {
 }
 
 func (s *Store) AllMinters() ([]*Minter, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	rows, err := s.db.Query(`SELECT data FROM minters ORDER BY apply_date DESC`)
 	if err != nil {
 		return nil, err
@@ -190,8 +188,6 @@ func (s *Store) AllMinters() ([]*Minter, error) {
 }
 
 func (s *Store) MinterCount() (int, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	var n int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM minters`).Scan(&n)
 	return n, err
@@ -200,8 +196,8 @@ func (s *Store) MinterCount() (int, error) {
 // ---------------- leadrate ----------------
 
 func (s *Store) BulkUpsertLeadrateApproved(items []*LeadrateApproved) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -233,8 +229,8 @@ func (s *Store) BulkUpsertLeadrateApproved(items []*LeadrateApproved) error {
 }
 
 func (s *Store) BulkUpsertLeadrateProposed(items []*LeadrateProposed) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -267,14 +263,10 @@ func (s *Store) BulkUpsertLeadrateProposed(items []*LeadrateProposed) error {
 }
 
 func (s *Store) AllLeadrateApproved() ([]*LeadrateApproved, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	return queryLeadrateApproved(s.db, `SELECT data FROM leadrate_approved ORDER BY created DESC`)
 }
 
 func (s *Store) AllLeadrateProposed() ([]*LeadrateProposed, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	return queryLeadrateProposed(s.db, `SELECT data FROM leadrate_proposed ORDER BY created DESC`)
 }
 
@@ -323,8 +315,8 @@ func queryLeadrateProposed(db *sql.DB, q string, args ...any) ([]*LeadratePropos
 // ---------------- fps holders + delegations ----------------
 
 func (s *Store) BulkUpsertFPSHolders(items []*FPSHolder) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -352,8 +344,6 @@ func (s *Store) BulkUpsertFPSHolders(items []*FPSHolder) error {
 // lossy past ~2^53 but fine for ranking (FPS supply is ~9k tokens; even
 // rebased it never approaches that limit).
 func (s *Store) FPSHoldersTop(limit int) ([]*FPSHolder, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	rows, err := s.db.Query(`
 		SELECT account, balance, updated FROM fps_holders
 		ORDER BY CAST(balance AS REAL) DESC
@@ -375,8 +365,8 @@ func (s *Store) FPSHoldersTop(limit int) ([]*FPSHolder, error) {
 }
 
 func (s *Store) BulkUpsertDelegations(items []*EquityDelegation) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -401,8 +391,6 @@ func (s *Store) BulkUpsertDelegations(items []*EquityDelegation) error {
 }
 
 func (s *Store) AllDelegations() ([]*EquityDelegation, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	rows, err := s.db.Query(`SELECT owner, delegated_to FROM equity_delegations`)
 	if err != nil {
 		return nil, err
@@ -420,16 +408,12 @@ func (s *Store) AllDelegations() ([]*EquityDelegation, error) {
 }
 
 func (s *Store) FPSHolderCount() (int, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	var n int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM fps_holders`).Scan(&n)
 	return n, err
 }
 
 func (s *Store) DelegationCount() (int, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	var n int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM equity_delegations`).Scan(&n)
 	return n, err
