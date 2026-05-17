@@ -61,16 +61,20 @@ type Store struct {
 
 func Open(path string) (*Store, error) {
 	// Pragmas:
-	//   journal_mode(WAL)  — concurrent readers + one writer
-	//   busy_timeout(5000) — wait up to 5s on contention before SQLITE_BUSY
-	//   cache_size(-64000) — 64 MiB page cache (negative units = KiB)
-	//   temp_store(MEMORY) — keep temp tables off disk
+	//   journal_mode(WAL)        — concurrent readers + one writer
+	//   busy_timeout(5000)       — wait up to 5s on contention before SQLITE_BUSY
+	//   cache_size(-64000)       — 64 MiB page cache (negative units = KiB)
+	//   temp_store(MEMORY)       — keep temp tables off disk
+	//   mmap_size(268435456)     — 256 MiB memory-mapped I/O, fewer syscalls on reads
+	//   wal_autocheckpoint(2000) — checkpoint every 2000 pages instead of 1000
 	//   synchronous: left at default (FULL). Do not relax: durability gate.
 	db, err := sql.Open("sqlite3", "file:"+path+
 		"?_pragma=journal_mode(WAL)"+
 		"&_pragma=busy_timeout(5000)"+
 		"&_pragma=cache_size(-64000)"+
-		"&_pragma=temp_store(MEMORY)")
+		"&_pragma=temp_store(MEMORY)"+
+		"&_pragma=mmap_size(268435456)"+
+		"&_pragma=wal_autocheckpoint(2000)")
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +94,11 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	// PRAGMA optimize: rebuilds query planner stats. Recommended on close.
+	_, _ = s.db.Exec("PRAGMA optimize")
+	return s.db.Close()
+}
 
 func (s *Store) migrate() error {
 	_, err := s.db.Exec(`

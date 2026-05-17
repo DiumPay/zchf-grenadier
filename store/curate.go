@@ -26,7 +26,7 @@ type MonitoredPosition struct {
 // across all Active challenges for that position. The join is done in Go
 // rather than SQL because challenges store JSON blobs.
 func (s *Store) Monitored() ([]*MonitoredPosition, error) {
-	all, err := s.All()
+	all, err := s.AllLive()
 	if err != nil {
 		return nil, err
 	}
@@ -106,7 +106,7 @@ func nonZero(s string) bool {
 //   - rank by lowest effective interest = interest / (1 - reserve)
 //   - tiebreak: longest expiration
 func (s *Store) Curated() ([]*Position, error) {
-	all, err := s.All()
+	all, err := s.AllLive()
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +141,7 @@ func (s *Store) Curated() ([]*Position, error) {
 // re-sort. Sort uses (collateralBalance × price) / minted, computed in
 // big.Int to avoid float precision loss on 36-digit numbers.
 func (s *Store) Active() ([]*Position, error) {
-	all, err := s.All()
+	all, err := s.AllLive()
 	if err != nil {
 		return nil, err
 	}
