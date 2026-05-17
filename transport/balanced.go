@@ -416,6 +416,21 @@ func (b *Balancer) recordBlockResp(url, method string, result json.RawMessage) {
 	}
 }
 
+// LastSeenBlock returns the highest block number observed across all
+// endpoints, plus the wall time it was observed. Used by callers (e.g. the
+// indexer) that would otherwise issue their own eth_blockNumber. Returns
+// (0, zero time) before any block-bearing call has succeeded.
+//
+// The value is refreshed by every call that returns a block number — both
+// the dedicated eth_blockNumber background ping and any cached eth_getLogs
+// / eth_getBlockByNumber response — so it's at least as fresh as one
+// provider's view, often fresher.
+func (b *Balancer) LastSeenBlock() (uint64, time.Time) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.lastBlock, b.lastBlockAt
+}
+
 // ---------------------------------------------------------------------------
 // Choose racers
 // ---------------------------------------------------------------------------

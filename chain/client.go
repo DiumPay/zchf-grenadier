@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/DiumPay/zchf-grenadier/transport"
 )
@@ -30,7 +31,21 @@ func New(rpc *transport.Balancer) *Client {
 	return &Client{rpc: rpc}
 }
 
+// blockCacheMaxAge bounds how stale the balancer's last-seen block can be
+// before we fall back to a real eth_blockNumber call. Mainnet blocks land
+// every ~12s; if the balancer hasn't recorded anything in this window,
+// either every endpoint is misbehaving or the indexer just started — both
+// cases want a fresh RPC.
+const blockCacheMaxAge = 20 * time.Second
+
+// BlockNumber returns the current chain head. Prefers the balancer's
+// in-memory last-seen block (updated by every cached call that returns a
+// block number) so the indexer's per-tick head check doesn't cost an RPC.
+// Falls back to a real eth_blockNumber if the cache is empty or stale.
 func (c *Client) BlockNumber(ctx context.Context) (uint64, error) {
+	if n, at := c.rpc.LastSeenBlock(); n > 0 && time.Since(at) < blockCacheMaxAge {
+		return n, nil
+	}
 	var hexStr string
 	if err := c.rpc.Call(ctx, "eth_blockNumber", []any{}, &hexStr); err != nil {
 		return 0, err
