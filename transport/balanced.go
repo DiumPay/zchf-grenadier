@@ -593,14 +593,30 @@ func (b *Balancer) raceOnce(parentCtx context.Context, racers []*endpoint, metho
 				b.recordWin(rr.url, rr.latency, method)
 				b.recordBlockResp(rr.url, method, rr.result)
 				cancel() // cancel siblings
-				// Record losers as "race lost" so they don't get penalized
+				// Drain the remaining racers. Two cases for each loser:
+				//   1. err == nil          — succeeded after the winner; we don't
+				//                            use the result, just drop it. Don't
+				//                            penalize, don't reward (it didn't
+				//                            actually win the race).
+				//   2. err is ctx.Canceled — we cancelled it; record as errRaceLost
+				//                            so recordFail's short-circuit skips
+				//                            the EWMA hit. This is the protective
+				//                            bucket the comment talks about.
+				//   3. any other err       — endpoint genuinely broke BEFORE we
+				//                            cancelled it. This is real signal
+				//                            about its health; record the actual
+				//                            error so the EWMA reflects it.
 				go func(n int) {
 					for j := 0; j < n; j++ {
 						lr := <-resultCh
 						if lr.err == nil {
 							continue
 						}
-						b.recordFail(lr.url, method, errRaceLost)
+						if errors.Is(lr.err, context.Canceled) {
+							b.recordFail(lr.url, method, errRaceLost)
+						} else {
+							b.recordFail(lr.url, method, lr.err)
+						}
 					}
 				}(len(racers) - i - 1)
 				return rr.result, rr.url, rr.latency, nil

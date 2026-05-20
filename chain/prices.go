@@ -156,6 +156,14 @@ func (pc *PriceCache) refresh(ctx context.Context) {
 	rows, err := pc.fetch(ctx)
 	if err != nil {
 		fmt.Printf("[prices] upstream fetch: %v (serving stale)\n", err)
+		// Stamp lastFill even on failure so subsequent /prices requests
+		// honor the TTL window instead of each one re-triggering a fresh
+		// upstream attempt. Without this, every API call while upstream
+		// is down spawns a 10s-timing-out HTTP request — turning one
+		// dead dependency into a self-inflicted DoS amplifier.
+		pc.mu.Lock()
+		pc.lastFill = time.Now()
+		pc.mu.Unlock()
 		return
 	}
 

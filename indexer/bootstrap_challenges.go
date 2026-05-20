@@ -65,10 +65,16 @@ type apiBidList struct {
 // V2-only. Sets the tail marker to current head — tick takes over from there.
 //
 // Failure modes:
-//   - Empty store + all peers down → set marker to head, tick watches from now.
-//     Currently zero active challenges so this loses nothing.
-//   - Empty store + any peer up → seed historical V2 data, set marker.
+//   - Empty store + all peers down → marker stays unset; tick keeps running
+//     from last_block, and the next process restart retries the seed. We
+//     deliberately do NOT advance the marker on failure: that would mean
+//     "starting fresh from current head" became permanent the first time
+//     peers happened to be unreachable, losing all historical data forever.
+//   - Empty store + any peer up → seed historical V2 data, advance marker.
 //   - Already seeded (marker set) → no-op.
+//
+// The live tick (loop.go) gates on last_block, not this marker, so the
+// indexer keeps moving forward regardless of bootstrap status.
 func BootstrapChallenges(ctx context.Context, st *store.Store, ch *chain.Client) error {
 	if v, _ := st.GetMeta(bootChalMarker); v != "" {
 		return nil // already bootstrapped, tick resumes from marker
@@ -82,11 +88,11 @@ func BootstrapChallenges(ctx context.Context, st *store.Store, ch *chain.Client)
 	t0 := time.Now()
 	chalCount, bidCount, apiErr := seedFromPeers(ctx, st)
 	if apiErr != nil {
-		fmt.Printf("[bootstrap-chal] peer fetch failed (%v) — starting fresh from block %d\n", apiErr, head)
-	} else {
-		fmt.Printf("[bootstrap-chal] seeded %d challenges, %d bids in %v (V2 only)\n",
-			chalCount, bidCount, time.Since(t0))
+		fmt.Printf("[bootstrap-chal] peer fetch failed (%v) — leaving marker unset so next startup retries\n", apiErr)
+		return nil
 	}
+	fmt.Printf("[bootstrap-chal] seeded %d challenges, %d bids in %v (V2 only)\n",
+		chalCount, bidCount, time.Since(t0))
 
 	return st.SetMeta(bootChalMarker, strconv.FormatUint(head, 10))
 }

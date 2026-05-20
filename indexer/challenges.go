@@ -136,9 +136,18 @@ func handleStarted(ctx context.Context, ch *chain.Client, st *store.Store, log c
 	// Idempotency: ChallengeStarted is one event per (position, number) and
 	// fully determines the row, so re-seeing it during the overlap rescan
 	// should not overwrite mutations that handleAverted/handleSucceeded made
-	// in the meantime. Skip if the row is already there.
+	// in the meantime. Skip if the row is already there AND fully populated.
+	//
+	// "Fully populated" matters: if the very first scan ran while an RPC
+	// hiccup made HydratePosition fail, the row was written with empty
+	// liqPrice / zero duration. We want the next overlap rescan to backfill
+	// those — but we must NOT clobber Bids / FilledSize / Status that
+	// handleAverted / handleSucceeded may have advanced in between. So when
+	// we detect an incomplete existing row, we read it and patch the two
+	// position-derived fields in place rather than building a fresh row.
 	id := challengeID(position, number)
-	if existing, _ := st.GetChallenge(id); existing != nil {
+	existing, _ := st.GetChallenge(id)
+	if existing != nil && existing.LiqPrice != "" && existing.LiqPrice != "0" && existing.Duration > 0 {
 		return nil
 	}
 
@@ -153,6 +162,14 @@ func handleStarted(ctx context.Context, ch *chain.Client, st *store.Store, log c
 	} else if pos, _ := ch.HydratePosition(ctx, position, nil); pos != nil {
 		duration = pos.ChallengePeriod
 		liqPrice = pos.Price
+	}
+
+	// If we're backfilling a previously-incomplete row, hydration must
+	// actually have produced something useful this time. Skip the write
+	// if we'd just be re-writing the same empty values — let the next
+	// overlap rescan try again when the RPC is healthier.
+	if existing != nil && (liqPrice == "" || liqPrice == "0" || duration <= 0) {
+		return nil
 	}
 
 	c := &store.Challenge{
@@ -172,6 +189,15 @@ func handleStarted(ctx context.Context, ch *chain.Client, st *store.Store, log c
 		Status:             "Active",
 		Version:            2,
 		Block:              int64(log.BlockNum()),
+	}
+	// Backfill path: preserve bid-derived state from the existing row so we
+	// don't undo any handleAverted / handleSucceeded mutations that landed
+	// between the first (incomplete) write and this rescan.
+	if existing != nil {
+		c.Bids = existing.Bids
+		c.FilledSize = existing.FilledSize
+		c.AcquiredCollateral = existing.AcquiredCollateral
+		c.Status = existing.Status
 	}
 	return st.UpsertChallenge(c, int64(log.BlockNum()))
 }
