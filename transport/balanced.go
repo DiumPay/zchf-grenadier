@@ -279,16 +279,24 @@ func (b *Balancer) weightedSample(pool []*endpoint, k int, tip uint64) []*endpoi
 	out := make([]*endpoint, 0, k)
 	for picked := 0; picked < k; picked++ {
 		if total <= 0 {
-			// Degenerate: all-zero scores (every endpoint penalized). Fall
-			// back to picking the first remaining candidate so the caller
-			// still gets a racer.
+			// Degenerate: every endpoint is penalized down to a score of 0
+			// (all in cooldown, all rate-limited, etc). Picking the first
+			// un-chosen slot in slice order would mean we always retry the
+			// same endpoint first whenever the pool is melting — which is
+			// exactly when we want to spread load. Collect the remaining
+			// candidates and pick one uniformly at random.
+			remaining := make([]int, 0, len(chosen)-picked)
 			for i, c := range chosen {
 				if !c {
-					out = append(out, pool[i])
-					chosen[i] = true
-					break
+					remaining = append(remaining, i)
 				}
 			}
+			if len(remaining) == 0 {
+				continue
+			}
+			idx := remaining[rand.Intn(len(remaining))]
+			out = append(out, pool[idx])
+			chosen[idx] = true
 			continue
 		}
 		r := rand.Float64() * total

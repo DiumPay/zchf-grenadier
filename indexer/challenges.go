@@ -133,6 +133,15 @@ func handleStarted(ctx context.Context, ch *chain.Client, st *store.Store, log c
 	size := new(big.Int).SetBytes(data[0:32])
 	number := new(big.Int).SetBytes(data[32:64]).Uint64()
 
+	// Idempotency: ChallengeStarted is one event per (position, number) and
+	// fully determines the row, so re-seeing it during the overlap rescan
+	// should not overwrite mutations that handleAverted/handleSucceeded made
+	// in the meantime. Skip if the row is already there.
+	id := challengeID(position, number)
+	if existing, _ := st.GetChallenge(id); existing != nil {
+		return nil
+	}
+
 	// ChallengePeriod + Price are written into the position row by Refresh
 	// earlier in this same tick. Hit the store first; fall back to chain
 	// only for positions not yet hydrated (early-bootstrap race).
@@ -147,7 +156,7 @@ func handleStarted(ctx context.Context, ch *chain.Client, st *store.Store, log c
 	}
 
 	c := &store.Challenge{
-		ID:                 challengeID(position, number),
+		ID:                 id,
 		Position:           position,
 		Number:             number,
 		TxHash:             log.TxHash,
@@ -174,6 +183,13 @@ func handleStarted(ctx context.Context, ch *chain.Client, st *store.Store, log c
 func handleAverted(st *store.Store, log chain.Log, bidder string) error {
 	if len(log.Topics) < 2 {
 		return fmt.Errorf("Averted: missing topics")
+	}
+	// Idempotency: a given on-chain log produces exactly one bid. If we've
+	// already processed this (txHash, logIndex) — which happens every overlap
+	// rescan — skip the whole handler so cur.Bids/FilledSize don't advance
+	// twice and we don't write a phantom second bid row.
+	if seen, _ := st.BidExistsByLog(log.TxHash, log.LogIdx()); seen {
+		return nil
 	}
 	position := chain.TopicToAddress(log.Topics[1])
 	data, err := hexToBytes(log.Data)
@@ -228,6 +244,7 @@ func handleAverted(st *store.Store, log chain.Log, bidder string) error {
 		Number:             number,
 		NumberBid:          numberBid,
 		TxHash:             log.TxHash,
+		LogIndex:           log.LogIdx(),
 		Bidder:             bidder,
 		Created:            0, // filled in by caller if available
 		BidType:            "Averted",
@@ -249,6 +266,11 @@ func handleAverted(st *store.Store, log chain.Log, bidder string) error {
 func handleSucceeded(st *store.Store, log chain.Log, bidder string) error {
 	if len(log.Topics) < 2 {
 		return fmt.Errorf("Succeeded: missing topics")
+	}
+	// Idempotency: skip if (txHash, logIndex) already produced a bid row.
+	// See the matching block in handleAverted for the why.
+	if seen, _ := st.BidExistsByLog(log.TxHash, log.LogIdx()); seen {
+		return nil
 	}
 	position := chain.TopicToAddress(log.Topics[1])
 	data, err := hexToBytes(log.Data)
@@ -312,6 +334,7 @@ func handleSucceeded(st *store.Store, log chain.Log, bidder string) error {
 		Number:             number,
 		NumberBid:          numberBid,
 		TxHash:             log.TxHash,
+		LogIndex:           log.LogIdx(),
 		Bidder:             bidder,
 		Created:            0,
 		BidType:            "Succeeded",

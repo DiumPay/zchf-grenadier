@@ -34,6 +34,7 @@ type Bid struct {
 	Number             uint64 `json:"number"`    // challenge number
 	NumberBid          uint64 `json:"numberBid"` // bid index within challenge
 	TxHash             string `json:"txHash"`
+	LogIndex           uint64 `json:"logIndex"` // log index within tx; used with TxHash for idempotency
 	Bidder             string `json:"bidder"`
 	Created            int64  `json:"created"` // unix seconds
 	BidType            string `json:"bidType"` // 'Averted' | 'Succeeded'
@@ -67,10 +68,18 @@ func (s *Store) migrateChallenges() error {
 			data TEXT NOT NULL,
 			bidder TEXT NOT NULL,
 			position TEXT NOT NULL,
+			tx_hash TEXT NOT NULL DEFAULT '',
+			log_index INTEGER NOT NULL DEFAULT 0,
 			block INTEGER NOT NULL
 		);
 		CREATE INDEX IF NOT EXISTS idx_bids_bidder ON bids(bidder);
 		CREATE INDEX IF NOT EXISTS idx_bids_position ON bids(position);
+		-- Idempotency lookup: live-indexed bids store (txHash, logIndex) so the
+		-- overlap rescan can detect and skip already-processed events instead
+		-- of double-incrementing the challenge counter. Bootstrap-imported
+		-- bids set txHash but not logIndex, so we cannot make this UNIQUE.
+		-- BidExistsByLog does the explicit existence check.
+		CREATE INDEX IF NOT EXISTS idx_bids_txlog ON bids(tx_hash, log_index);
 	`)
 	return err
 }
@@ -206,26 +215,55 @@ func (s *Store) queryChallenges(query string, args ...any) ([]*Challenge, error)
 
 // ---------------- bids ----------------
 
+// BidExistsByLog returns true if a bid row already exists for the given
+// (txHash, logIndex) pair. Used by the challenge indexer to make the
+// overlap-window rescan idempotent: each on-chain bid event is the source
+// of truth for exactly one bid row, so a second rescan of the same log
+// should be a no-op rather than incrementing counters again.
+//
+// txHash should be lowercase. Returns (false, nil) for empty txHash, which
+// matches bootstrap-imported bids that don't have a logIndex anyway.
+func (s *Store) BidExistsByLog(txHash string, logIndex uint64) (bool, error) {
+	if txHash == "" {
+		return false, nil
+	}
+	var one int
+	err := s.db.QueryRow(
+		`SELECT 1 FROM bids WHERE tx_hash = ? AND log_index = ? LIMIT 1`,
+		strings.ToLower(txHash), logIndex,
+	).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *Store) UpsertBid(b *Bid) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
 	b.Bidder = strings.ToLower(b.Bidder)
 	b.Position = strings.ToLower(b.Position)
+	b.TxHash = strings.ToLower(b.TxHash)
 
 	blob, err := json.Marshal(b)
 	if err != nil {
 		return err
 	}
 	_, err = s.db.Exec(`
-		INSERT INTO bids(id, data, bidder, position, block)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT INTO bids(id, data, bidder, position, tx_hash, log_index, block)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			data=excluded.data,
 			bidder=excluded.bidder,
 			position=excluded.position,
+			tx_hash=excluded.tx_hash,
+			log_index=excluded.log_index,
 			block=excluded.block
-	`, b.ID, string(blob), b.Bidder, b.Position, b.Block)
+	`, b.ID, string(blob), b.Bidder, b.Position, b.TxHash, b.LogIndex, b.Block)
 	return err
 }
 
@@ -244,12 +282,14 @@ func (s *Store) BulkUpsertBids(list []*Bid) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO bids(id, data, bidder, position, block)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT INTO bids(id, data, bidder, position, tx_hash, log_index, block)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			data=excluded.data,
 			bidder=excluded.bidder,
 			position=excluded.position,
+			tx_hash=excluded.tx_hash,
+			log_index=excluded.log_index,
 			block=excluded.block
 	`)
 	if err != nil {
@@ -260,11 +300,12 @@ func (s *Store) BulkUpsertBids(list []*Bid) error {
 	for _, b := range list {
 		b.Bidder = strings.ToLower(b.Bidder)
 		b.Position = strings.ToLower(b.Position)
+		b.TxHash = strings.ToLower(b.TxHash)
 		blob, err := json.Marshal(b)
 		if err != nil {
 			return err
 		}
-		if _, err := stmt.Exec(b.ID, string(blob), b.Bidder, b.Position, b.Block); err != nil {
+		if _, err := stmt.Exec(b.ID, string(blob), b.Bidder, b.Position, b.TxHash, b.LogIndex, b.Block); err != nil {
 			return err
 		}
 	}
