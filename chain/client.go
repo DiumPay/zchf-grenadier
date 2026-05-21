@@ -13,14 +13,44 @@ import (
 
 const Multicall3Address = "0xcA11bde05977b3631167028862bE2a173976CA11"
 
+// Event topic hashes for Frankencoin MintingHubV2 and PositionV2.
+//
+// These are keccak256(eventSignature) and MUST match the deployed contracts
+// exactly — a single wrong character silently breaks indexing because
+// eth_getLogs filters by topic[0] and returns nothing on a mismatch.
+//
+// Verified against the official contract source in @frankencoin/zchf
+// (contracts/minting/v2/MintingHubV2.sol and PositionV2.sol). The
+// TestTopicHashes unit test re-derives all of these from the signature
+// strings on every test run, so a regression cannot ship unnoticed.
 const (
-	TopicPositionOpened   = "0x0fcf2cc70f4e23dd5b40d8a420186fd886f8dfde64eb4b8a2dafe2c52727b69c"
-	TopicMintingUpdate    = "0x9483a26ad376f30b5199a79e75df3bb05158c4ee32a348f53e83245a5e50c86e"
-	TopicPositionDenied   = "0x9416d6a3a9c0c25b16fb33e2a4d27ff42a4880466cd9c2ec5e4c45c6e9b65c8a"
-	TopicOwnership        = "0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0"
+	// MintingHubV2.sol
+	// event PositionOpened(address indexed owner, address indexed position, address original, address collateral);
+	TopicPositionOpened = "0xc9b570ab9d98bdf3e38a40fd71b20edafca42449f23ca51f0bdcbf40e8ffe175"
+	// event ChallengeStarted(address indexed challenger, address indexed position, uint256 size, uint256 number);
 	TopicChallengeStarted = "0xc4b384b2c5ca32c8e77081f4083be594a1ea9ba34f208a9f9a458f70608585f5"
+	// event ChallengeAverted(address indexed position, uint256 number, uint256 size);
 	TopicChallengeAverted = "0x1eee30d91b773ac47d7485a3acb6bcd8c7c9cd8d95301b1af361baf5f0991d2e"
+	// event ChallengeSucceeded(address indexed position, uint256 number, uint256 bid, uint256 acquiredCollateral, uint256 challengeSize);
 	TopicChallengeSucceed = "0x7d3a26e8d43c5b70f86266bfa26c212e3c097716ff7240ccb6a9034e48754e23"
+	// event PostPonedReturn(address collateral, address indexed beneficiary, uint256 amount);
+	TopicPostponedReturn = "0x8ab298b78a235f73eee230f82012c0cf4db76003eaabd16a0195f112e7d625c8"
+	// event ForcedSale(address pos, uint256 amount, uint256 priceE36MinusDecimals);
+	// Critical for Refresh: when collateral leaves a position via forced sale
+	// post-expiration, no MintingUpdate fires, so without this topic the
+	// stored CollateralBalance drifts away from on-chain truth forever.
+	TopicForcedSale = "0x67a660133c1fb4c0bb0480a5e4a9919216684052f13f0713e88fa2fbbc81d082"
+
+	// PositionV2.sol
+	// event MintingUpdate(uint256 collateral, uint256 price, uint256 minted);
+	TopicMintingUpdate = "0x9483a26ad376f30b5199a79e75df3bb05158c4ee32a348f53e83245a5e50c86e"
+	// event PositionDenied(address indexed sender, string message);
+	TopicPositionDenied = "0xaca80c800ec0d2aa9d9d31b7f886a1dd3067d4676abc637626a18ffb9381653d"
+
+	// Standard OpenZeppelin Ownable event, emitted by Position contracts
+	// during the CloneHelper handoff. Used by ResolveOwner.
+	// event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+	TopicOwnership = "0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0"
 )
 
 type Client struct {
