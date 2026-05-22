@@ -10,7 +10,9 @@ services:
       - grenadier_data:/data
     environment:
       - GRENADIER_BIND=0.0.0.0
+      # Optional: enables POST /near/quote (NEAR 1Click swap proxy with fee waiver).
+      # Apply for a JWT at https://partners.near-intents.org
+      # - NEAR_JWT=${NEAR_JWT}
     restart: unless-stopped
-
 volumes:
   grenadier_data:

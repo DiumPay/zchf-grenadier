@@ -112,10 +112,11 @@ func (s *Server) routes() {
 		CrossOriginResourcePolicy: "cross-origin",
 	}))
 
-	// CORS — public read API
+	// CORS — public read API. POST is allowed too, but only the /near/* routes
+	// accept POST per the method allowlist below.
 	s.app.Use(cors.New(cors.Config{
 		AllowOrigins:  []string{"*"},
-		AllowMethods:  []string{"GET", "HEAD", "OPTIONS"},
+		AllowMethods:  []string{"GET", "HEAD", "OPTIONS", "POST"},
 		AllowHeaders:  []string{"Content-Type"},
 		ExposeHeaders: []string{"Content-Length"},
 		MaxAge:        86400,
@@ -130,13 +131,16 @@ func (s *Server) routes() {
 		return c.Next()
 	})
 
-	// method allowlist
+	// method allowlist. /near/* allows POST since the NEAR proxy needs it.
 	s.app.Use(func(c fiber.Ctx) error {
 		m := c.Method()
-		if m != "GET" && m != "HEAD" && m != "OPTIONS" {
-			return c.Status(405).JSON(fiber.Map{"error": "method not allowed"})
+		if m == "GET" || m == "HEAD" || m == "OPTIONS" {
+			return c.Next()
 		}
-		return c.Next()
+		if m == "POST" && strings.HasPrefix(c.Path(), "/near/") {
+			return c.Next()
+		}
+		return c.Status(405).JSON(fiber.Map{"error": "method not allowed"})
 	})
 
 	// Rate limiting: two layers, both keyed on real client IP.
@@ -192,6 +196,8 @@ func (s *Server) routes() {
 	cacheGovernance := mk(60 * time.Second)
 
 	s.app.Get("/health", s.handleHealth)
+	// Public robots.txt — block all polite bots from the API surface.
+	s.app.Get("/robots.txt", handleRobotsTxt)
 	s.app.Get("/positions", cachePositions, s.handleAllPositions)
 	s.app.Get("/positions/curated", cacheCurated, s.handleCurated)
 	s.app.Get("/positions/monitored", cachePositions, s.handleMonitored)
@@ -210,6 +216,14 @@ func (s *Server) routes() {
 	s.app.Get("/governance/leadrate", cacheGovernance, s.handleGovernanceLeadrate)
 	s.app.Get("/governance/fps-holders", cacheGovernance, s.handleGovernanceFPSHolders)
 	s.app.Get("/governance/delegations", cacheGovernance, s.handleGovernanceDelegations)
+
+	// NEAR 1Click proxy — opt-in via NEAR_JWT env var.
+	// Without a JWT set, /near/quote 404s. Operator-friendly: no flags to set,
+	// presence of the token IS the enable signal.
+	if jwt := nearJWT(); jwt != "" {
+		s.registerNearRoutes(jwt)
+		fmt.Println("[api] near 1click proxy enabled at POST /near/quote")
+	}
 
 	// catch-all 404
 	s.app.Use(func(c fiber.Ctx) error {
