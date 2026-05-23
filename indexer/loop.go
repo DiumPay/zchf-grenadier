@@ -14,7 +14,13 @@ const (
 	tickInterval  = 12 * time.Second
 	maxBlockRange = 2000 // safe for almost every public RPC
 	safetyDepth   = 5    // don't index up to head — reorg margin
-	overlap       = 10   // re-scan last N blocks each tick for extra safety
+	// overlap: re-scan last N blocks each tick. Tuned wide enough that a
+	// single lying RPC (one that returns [] for eth_getLogs without erroring)
+	// won't permanently skip events — by the next tick the same range is
+	// still in the re-scan window and gets another shot at a different
+	// racer. ~300 blocks ≈ 60 min on mainnet. getLogs on a tiny address set
+	// is essentially free; the cost of being too generous here is nothing.
+	overlap = 300
 )
 
 type Indexer struct {

@@ -49,11 +49,21 @@ type Config struct {
 
 func defaults() Config {
 	return Config{
-		PerAttemptTimeout:  4 * time.Second,
-		TotalBudget:        30 * time.Second,
-		MaxRetries:         5,
-		ColdFanout:         2,
-		WarmFanout:         1,
+		PerAttemptTimeout: 4 * time.Second,
+		TotalBudget:       30 * time.Second,
+		MaxRetries:        5,
+		// Fanout: how many endpoints race in parallel per call. The pool is
+		// 24 public RPCs; racing only 1–2 leaves the system at the mercy of
+		// whichever endpoint answers first, including ones that silently
+		// return [] for eth_getLogs without erroring. Warm=1 in particular
+		// meant zero verification once an endpoint became sticky — one
+		// liar that won twice could then dictate truth alone. Cold=5 /
+		// Warm=3 means at least 2 other endpoints must agree (or fail) for
+		// a liar to win. Cost is 3–5× the HTTP requests per call, but most
+		// calls are cached (CallTTL + BlockAwareCache) so the real
+		// amplification on the hot path is far smaller.
+		ColdFanout:         5,
+		WarmFanout:         3,
 		PromoteWins:        2,
 		StickyTTL:          60 * time.Second,
 		CallTTL:            2 * time.Second,
