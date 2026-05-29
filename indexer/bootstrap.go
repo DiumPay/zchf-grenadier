@@ -16,6 +16,9 @@ type apiPosition struct {
 	Position             string      `json:"position"`
 	Owner                string      `json:"owner"`
 	Zchf                 string      `json:"zchf"`
+	ZchfName             string      `json:"zchfName"`
+	ZchfSymbol           string      `json:"zchfSymbol"`
+	ZchfDecimals         int         `json:"zchfDecimals"`
 	Collateral           string      `json:"collateral"`
 	Price                string      `json:"price"`
 	Created              int64       `json:"created"`
@@ -115,6 +118,9 @@ func convertAPI(p *apiPosition) *store.Position {
 		Position:             strings.ToLower(p.Position),
 		Owner:                strings.ToLower(p.Owner),
 		Zchf:                 strings.ToLower(p.Zchf),
+		ZchfName:             p.ZchfName,
+		ZchfSymbol:           p.ZchfSymbol,
+		ZchfDecimals:         p.ZchfDecimals,
 		Collateral:           strings.ToLower(p.Collateral),
 		Price:                p.Price,
 		Created:              p.Created,

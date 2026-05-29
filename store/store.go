@@ -28,6 +28,9 @@ type Position struct {
 	Closed               bool   `json:"closed"`
 	Original             string `json:"original"`
 	Parent               string `json:"parent,omitempty"`
+	ZchfName             string `json:"zchfName,omitempty"`
+	ZchfSymbol           string `json:"zchfSymbol,omitempty"`
+	ZchfDecimals         int    `json:"zchfDecimals,omitempty"`
 	MinimumCollateral    string `json:"minimumCollateral"`
 	AnnualInterestPPM    int    `json:"annualInterestPPM"`
 	RiskPremiumPPM       int    `json:"riskPremiumPPM"`
@@ -128,6 +131,51 @@ func (s *Store) Upsert(p *Position, block int64) error {
 	p.Position = strings.ToLower(p.Position)
 	p.Owner = strings.ToLower(p.Owner)
 
+	// Merge: HydratePosition (the refresh path) only populates the fields it
+	// reads on-chain. Several fields are seeded once at bootstrap and never
+	// re-derived: Created, Parent, AnnualInterestPPM, DenyDate, LimitForClones,
+	// AvailableForPosition. A naive `data=excluded.data` wipes them to zero on
+	// the first refresh. Pull the prior row (cheap, same lock) and carry those
+	// forward when the incoming value is empty/zero.
+	if prev := s.getPositionLocked(p.Position); prev != nil {
+		if p.Created == 0 {
+			p.Created = prev.Created
+		}
+		if p.Parent == "" {
+			p.Parent = prev.Parent
+		}
+		if p.AnnualInterestPPM == 0 {
+			p.AnnualInterestPPM = prev.AnnualInterestPPM
+		}
+		if p.DenyDate == 0 {
+			p.DenyDate = prev.DenyDate
+		}
+		if !p.Denied && prev.Denied {
+			p.Denied = prev.Denied // denial is sticky
+		}
+		if p.LimitForClones == "" {
+			p.LimitForClones = prev.LimitForClones
+		}
+		if p.AvailableForPosition == "" {
+			p.AvailableForPosition = prev.AvailableForPosition
+		}
+		if p.ZchfName == "" {
+			p.ZchfName = prev.ZchfName
+		}
+		if p.ZchfSymbol == "" {
+			p.ZchfSymbol = prev.ZchfSymbol
+		}
+		if p.ZchfDecimals == 0 {
+			p.ZchfDecimals = prev.ZchfDecimals
+		}
+		// Balance: keep prior non-empty value if the hydrate somehow came back
+		// empty, so a transient RPC miss can't blank a known balance.
+		if (p.CollateralBalance == "" || p.CollateralBalance == "0") &&
+			prev.CollateralBalance != "" && prev.CollateralBalance != "0" {
+			p.CollateralBalance = prev.CollateralBalance
+		}
+	}
+
 	blob, err := json.Marshal(p)
 	if err != nil {
 		return err
@@ -222,6 +270,22 @@ func (s *Store) All() ([]*Position, error) {
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// getPositionLocked is the lock-free body of GetPosition, for callers that
+// already hold writeMu (e.g. Upsert's merge step). Returns nil if not found
+// or on any error — merge treats a missing prior row as "nothing to carry".
+func (s *Store) getPositionLocked(addr string) *Position {
+	var blob string
+	err := s.db.QueryRow(`SELECT data FROM positions WHERE position = ?`, strings.ToLower(addr)).Scan(&blob)
+	if err != nil {
+		return nil
+	}
+	p := &Position{}
+	if json.Unmarshal([]byte(blob), p) != nil {
+		return nil
+	}
+	return p
 }
 
 // GetPosition returns nil, nil if not found.

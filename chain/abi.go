@@ -43,6 +43,7 @@ var (
 	selName                = selector("name()")
 	selSymbol              = selector("symbol()")
 	selDecimals            = selector("decimals()")
+	selBalanceOf           = selector("balanceOf(address)")
 
 	// aggregate3((address,bool,bytes)[])
 	selAggregate3 = selector("aggregate3((address,bool,bytes)[])")

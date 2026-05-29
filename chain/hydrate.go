@@ -113,6 +113,31 @@ func (c *Client) HydratePosition(
 	p.IsOriginal = p.Original == p.Position
 	p.IsClone = !p.IsOriginal
 
+	// CollateralBalance is collateralToken.balanceOf(position) — NOT a method
+	// on the position contract, so it can't ride in the batch above (we only
+	// learn p.Collateral from that batch). One extra call against the token.
+	// Without this, refresh overwrites the stored blob with an empty balance
+	// and the value drifts permanently away from on-chain truth.
+	if p.Collateral != "" {
+		posArg, err := encodeAddress(addr)
+		if err == nil {
+			balCall := append(append([]byte{}, selBalanceOf[:]...), posArg...)
+			bdata, berr := encodeAggregate3([]mcCall{
+				{target: p.Collateral, allowFailure: true, callData: balCall},
+			})
+			if berr == nil {
+				if bresp, e := c.ethCall(ctx, Multicall3Address, bdata); e == nil {
+					if bres, e2 := decodeAggregate3Result(bresp); e2 == nil &&
+						len(bres) >= 1 && bres[0].Success {
+						if v, e3 := decodeUint256(bres[0].ReturnData, 0); e3 == nil && v != nil {
+							p.CollateralBalance = v.String()
+						}
+					}
+				}
+			}
+		}
+	}
+
 	if collateralMeta != nil {
 		meta, ok := collateralMeta[p.Collateral]
 		if !ok {
@@ -125,6 +150,24 @@ func (c *Client) HydratePosition(
 		p.CollateralName = meta.Name
 		p.CollateralSymbol = meta.Symbol
 		p.CollateralDecimals = meta.Decimals
+
+		// ZCHF token metadata. Same shape as collateral; the official API
+		// includes zchfName/zchfSymbol/zchfDecimals and consumers expect them.
+		// ZCHF is one fixed address so this resolves once and is cached in the
+		// same map (keyed by the zchf address — distinct from any collateral).
+		if p.Zchf != "" {
+			zmeta, ok := collateralMeta[p.Zchf]
+			if !ok {
+				m, err := c.HydrateERC20(ctx, p.Zchf)
+				if err == nil {
+					zmeta = *m
+					collateralMeta[p.Zchf] = zmeta
+				}
+			}
+			p.ZchfName = zmeta.Name
+			p.ZchfSymbol = zmeta.Symbol
+			p.ZchfDecimals = zmeta.Decimals
+		}
 	}
 	return p, nil
 }
