@@ -85,11 +85,6 @@ func isMonitorable(p *Position, _ int64) bool {
 	return ok && bal.Sign() > 0
 }
 
-func nonZero(s string) bool {
-	v, ok := new(big.Int).SetString(s, 10)
-	return ok && v.Sign() > 0
-}
-
 // Curated returns one position per collateral, picked by:
 //   - must be active: not closed, not denied, not expired, not in cooldown
 //   - must have room to mint (availableForClones > 0)

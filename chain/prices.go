@@ -26,6 +26,7 @@ var TrackedSymbols = map[string]bool{
 	"SPYON": true, // case-insensitive lookup, stored uppercase
 	"LENDS": true,
 	"FPS":   true,
+	"DQTS":  true,
 }
 
 // Price is a row from upstream /prices/list, slimmed.
