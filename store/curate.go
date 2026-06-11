@@ -77,22 +77,12 @@ func (s *Store) Monitored() ([]*MonitoredPosition, error) {
 	return out, nil
 }
 
-// isMonitorable: the position can still be challenged. Looser than
-// isCuratable — we don't require room to mint, just that the position
-// holds value worth defending.
-func isMonitorable(p *Position, now int64) bool {
+func isMonitorable(p *Position, _ int64) bool {
 	if p.Closed || p.Denied {
 		return false
 	}
-	if p.Expiration > 0 && now >= int64(p.Expiration) {
-		return false
-	}
-	if p.Cooldown > 0 && now < int64(p.Cooldown) {
-		return false
-	}
-	hasCollateral := nonZero(p.CollateralBalance)
-	hasDebt := nonZero(p.Minted)
-	return hasCollateral || hasDebt
+	bal, ok := new(big.Int).SetString(p.CollateralBalance, 10)
+	return ok && bal.Sign() > 0
 }
 
 func nonZero(s string) bool {
